@@ -461,7 +461,7 @@ proc _ns_stats.mem.cache {} {
             array set t [ns_cache_stats $cache]
             set avgSize [expr {$t(entries) > 0 ? $t(size)/$t(entries) : 0}]
             lappend results [list $cache $t(maxsize) $t(size) \
-                                 [expr {$t(size)*100.0/$t(maxsize)}] \
+                                 [expr {$t(maxsize) > 0 ? $t(size)*100.0/$t(maxsize) : 0.0}] \
                                  $t(entries) $avgSize $t(flushed) \
                                  $t(hits) \
                                  [format %.4f [expr {$totalRequests > 0 ? $t(hits)*1.0/$totalRequests : 0}]] \
@@ -2991,7 +2991,7 @@ proc _ns_stats.log.logfile {} {
     }
 
     try {
-        set errorLogFiles [lsort -decreasing [glob [ns_info log].*]]
+        set errorLogFiles [lsort -decreasing [glob -nocomplain [ns_info log].*]]
     } on error {errorMsg} {
         ns_log notice nsstats: $errorMsg
         set errorLogFiles {}
