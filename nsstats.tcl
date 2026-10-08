@@ -3759,9 +3759,13 @@ proc _ns_stats.memsizes {pid {pretty 0}} {
     set vsize [format %.2f [expr {$vsize         * 4}]]
   }
   if {$rss == 0} {
-    set sizes [exec -ignorestderr /bin/ps -o vsz,rss $pid]
-    set vsize [lindex $sizes end-1]
-    set rss   [lindex $sizes end]
+      try {
+        set sizes [exec -ignorestderr /bin/ps -o vsz,rss $pid]
+        set vsize [lindex $sizes end-1]
+        set rss   [lindex $sizes end]
+      } on error {errorMsg} {
+        # just return zeros when ps fails
+      }
   }
   if {$pretty} {
       set rss [_ns_stats.hr [expr {$rss*1024}]]B
@@ -3814,10 +3818,14 @@ proc _ns_stats.process {} {
                         set certfile [ns_config ns/module/$module certificate]
                     }
                     if {![info exists processed($certfile)]} {
-                        set notAfter [exec openssl x509 -enddate -noout -in $certfile]
-                        regexp {notAfter=(.*)$} $notAfter . date
-                        set days [expr {([clock scan $date] - [clock seconds])/(60*60*24.0)}]
-                        lappend certInfo "Certificate $certfile will expire in [format %.1f $days] days"
+                        try {
+                            set notAfter [exec openssl x509 -enddate -noout -in $certfile]
+                            regexp {notAfter=(.*)$} $notAfter . date
+                            set days [expr {([clock scan $date] - [clock seconds])/(60*60*24.0)}]
+                            lappend certInfo "Certificate $certfile will expire in [format %.1f $days] days"
+                        } on error {errorMsg} {
+                            # openssl binary not found
+                        } 
                         set processed($certfile) 1
                     }
                     set certificateLabel "Configured Certificates"
@@ -3927,8 +3935,12 @@ proc _ns_stats.process {} {
     }
 
     set processInfo [_ns_stats.memsizes [ns_info pid] 1]
-    set t [clock milliseconds]; set F [open "|cat" w]; puts $F "timing-pipe-open+puts"; close $F
-    dict set processInfo fork-time [expr {[clock milliseconds] - $t}]ms
+    try {
+        set t [clock milliseconds]; set F [open "|cat" w]; puts $F "timing-pipe-open+puts"; close $F
+        dict set processInfo fork-time [expr {[clock milliseconds] - $t}]ms
+    } on error {errorMsg} {
+        # no cats
+    }     
     set values [list \
                     Version              "[ns_info patchlevel] (tag $tag) $buildinfo" \
                     "Build Date"          [ns_info builddate] \
