@@ -52,42 +52,217 @@ if { ![nsv_exists _ns_stats threads_0] } {
 }
 set severity [expr {$debug ? "notice" : "debug"}]
 
-set ::navLinks [subst {
-    background        "Background"
-    background.jobs   "Jobs"
-    background.sched  "Scheduled Procedures"
-    config            "Configuration"
-    config.file       "Configuration File"
-    config.params     "Configuration Parameters"
-    locks             "Locks"
-    locks.mutex       "Mutex and RW-Locks"
-    locks.nsv         "Nsv Locks"
-    log               "Logging"
-    log.logfile       "System Log"
-    log.httpclient    "HTTP Client Log"
-    log.smtpsent      "SMTP Sent Log"
-    log.smtpevents    "SMTP Events"
-    log.levels        "Log Severities"
-    mem               "Memory"
-    mem.adp           "ADP"
-    mem.tcl           "Allocated Memory"
-    mem.cache         "Cache (ns_cache)"
-    mem.nsvsize       "Shared Variables (nsv)"
-    [expr {[info commands ns_json] ne "" ?  {utilization Utilization} : ""}]
-    process           "Process"
-    threads           "Threads"
-}]
+# One hierarchy shared by the menus, directory and breadcrumbs. Existing page
+# identifiers remain unchanged; optional pages are omitted when unavailable.
+set ::navGroups {
+    overview {Overview {
+        process {Process and servers} utilization Utilization threads Threads
+        list-lsof {Open files}
+    }}
+    memory {{Memory & storage} {
+        mem.tcl {Allocator memory} dbpools {Database pools}
+        mem.cache Caches mem.nsvsize {Shared variables} mem.adp ADP
+    }}
+    background {Background {
+        background.jobs Jobs background.sched {Scheduled procedures}
+        proxy-workers {Proxy workers}
+    }}
+    logs {Logs {
+        log.logfile {System log} log.httpclient {HTTP client log}
+        log.smtpsent {SMTP sent log} log.smtpevents {SMTP events}
+        log.levels {Log severities}
+    }}
+    administration {Administration {
+        config.file {Configuration file} config.params {Configuration parameters}
+        locks.mutex {Mutex and RW-locks} locks.nsv {NSV locks} mcp MCP
+    }}
+}
+set ::navScopes {
+    process global utilization global threads global list-lsof global
+    mem.tcl global dbpools global mem.cache server mem.nsvsize server mem.adp server
+    background.jobs global background.sched global proxy-workers global
+    config.file global config.params global locks.mutex server locks.nsv server mcp server
+    log.logfile global log.httpclient source log.smtpsent source log.smtpevents source
+    log.levels global
+}
 
-# The following entries have no counter parts in the navLinks
-# (we could add some of these to sub menus).
-#
-#    list-lsof         "Open Files"
-#    mapped            "Connection Pool Mappings"
-#    proxy-workers     "nsproxy Workers"
-#    url2file          "Url2File Mappings"
+proc _ns_stats.navigation.scope {page} {
+    if {$page eq "mem.nsvsize" && ![catch {nsv_array scope _ns_stats}]} {
+        return mixed
+    }
+    return [dict get $::navScopes $page]
+}
 
+proc _ns_stats.navigation.scopeLabel {scope} {
+    return [dict get {global Global server {Current server} mixed {Both scopes} source {Log source}} $scope]
+}
+
+# Preserve label lookup for templates that consume navLinks.
+set ::navLinks {}
+dict for {group definition} $::navGroups {
+    lassign $definition label entries
+    foreach {page title} $entries {
+        dict set ::navLinks [lindex [split $page #] 0] $title
+    }
+}
+
+proc _ns_stats.navigation.groups {} {
+    set result {}
+    dict for {group definition} $::navGroups {
+        lassign $definition label entries
+        set available {}
+        foreach {target title} $entries {
+            set page [lindex [split $target #] 0]
+            if {[info procs _ns_stats.$page] eq ""} {
+                continue
+            }
+            if {$page eq "mcp" && [info commands ::nsmcp::ToolRegistry] eq ""} {
+                continue
+            }
+            if {$page eq "utilization" && [info commands ns_json] eq ""} {
+                continue
+            }
+            if {$page eq "dbpools" && [info commands ns_db] eq ""} {
+                continue
+            }
+            if {$page eq "proxy-workers" && [info commands ns_proxy] eq ""} {
+                continue
+            }
+            lappend available $target $title
+        }
+        if {$available ne ""} {
+            dict set result $group [list $label $available]
+        }
+    }
+    return $result
+}
+
+proc _ns_stats.navigation.url {target} {
+    lassign [split $target #] page anchor
+    set url "?@page=$page$::rawparam"
+    if {$anchor ne ""} {
+        append url #$anchor
+    }
+    return [ns_quotehtml $url]
+}
+
+proc _ns_stats.navigation {} {
+    set groups ""
+    dict for {group definition} [_ns_stats.navigation.groups] {
+        lassign $definition label entries
+        append groups "<details class='ns-nav-group'><summary>[ns_quotehtml $label]</summary><div class='ns-nav-items'>"
+        foreach {target title} $entries {
+            set current ""
+            if {$target eq $::page} {
+                set current " aria-current='page'"
+            }
+            set scope [_ns_stats.navigation.scope $target]
+            append groups "<a href='[_ns_stats.navigation.url $target]'$current><span>[ns_quotehtml $title]</span><span class='ns-scope'>[_ns_stats.navigation.scopeLabel $scope]</span></a>"
+        }
+        append groups "</div></details>"
+    }
+    # Named details form exclusive groups: opening a menu closes its sibling.
+    # Keep desktop and mobile groups separate so hidden copies do not interfere.
+    set desktop [string map {"class='ns-nav-group'" "class='ns-nav-group' name='nsstats-desktop'"} $groups]
+    set mobile [string map {"class='ns-nav-group'" "class='ns-nav-group' name='nsstats-mobile'"} $groups]
+    set html "<nav class='ns-navigation' aria-label='Statistics navigation'><div class='ns-nav-desktop'>$desktop</div><details class='ns-nav-mobile'><summary>Menu</summary><div>$mobile</div></details></nav>"
+    append html "<div class='ns-server-context'>Current server: <strong>[ns_quotehtml [ns_info server]]</strong></div>"
+    append html {<script>
+(function () {
+  document.addEventListener('click', function (event) {
+    if (event.target.closest('.ns-navigation')) return;
+    document.querySelectorAll('.ns-navigation details[open]').forEach(function (menu) {
+      menu.open = false;
+    });
+  });
+  document.addEventListener('keydown', function (event) {
+    if (event.key !== 'Escape') return;
+    const focused = document.activeElement.closest('.ns-navigation details[open]');
+    document.querySelectorAll('.ns-navigation details[open]').forEach(function (menu) {
+      menu.open = false;
+    });
+    if (focused) focused.querySelector('summary').focus();
+  });
+})();
+</script>}
+    return $html
+}
+
+proc _ns_stats.navigation.breadcrumb {} {
+    if {$::page eq "index"} {
+        return "<span aria-current='page'>Main menu</span>"
+    }
+    set title [expr {[dict exists $::titles $::page] ? [dict get $::titles $::page] : "Main menu"}]
+    set label ""
+    set destination index
+    dict for {group definition} [_ns_stats.navigation.groups] {
+        lassign $definition groupLabel entries
+        if {$::page in $entries} {
+            set label $groupLabel
+            set destination index#nav-$group
+            break
+        }
+    }
+    if {$::page in {mapped requestprocs url2file}} {
+        set label Process
+        set destination process
+    }
+    set html "<a href='[_ns_stats.navigation.url index]'>Main menu</a>"
+    if {$label ne ""} {
+        append html " &gt; <a href='[_ns_stats.navigation.url $destination]'>[ns_quotehtml $label]</a>"
+    }
+    append html " &gt; <span aria-current='page'>[ns_quotehtml $title]</span>"
+    return $html
+}
+
+proc _ns_stats.navigation.style {} {
+    return {<style>
+.ns-navigation {background:var(--color-menubar-bg,#00376f);color:#fff;padding:0 12px;position:relative;z-index:20;font:14px Arial,sans-serif;}
+.ns-nav-desktop {display:flex;flex-wrap:wrap;gap:4px;}
+.ns-nav-group {position:relative;}
+.ns-navigation summary {cursor:pointer;padding:14px 12px;min-height:20px;}
+.ns-navigation summary:focus-visible,.ns-navigation a:focus-visible {outline:2px solid #ffcc00;outline-offset:-2px;}
+.ns-nav-items {position:absolute;min-width:220px;background:var(--color-dropdown-content-bg,#fff);border:1px solid var(--color-border,#ccc);box-shadow:0 4px 12px #0003;}
+.ns-nav-items a {display:flex;justify-content:space-between;align-items:center;gap:16px;padding:12px;color:var(--color-anchor,#004080);text-decoration:none;}
+.ns-nav-items a:hover,.ns-nav-items a[aria-current] {background:var(--color-dropdown-hover-bg,#e6eef7);}
+.ns-nav-mobile {display:none;}
+.mcp-tools th:nth-child(1),.mcp-tools td:nth-child(1) {width:18%;}
+.mcp-tools th:nth-child(2),.mcp-tools td:nth-child(2) {width:10%;}
+.mcp-tools th:nth-child(3),.mcp-tools td:nth-child(3) {width:38%;}
+.mcp-tools th:nth-child(4),.mcp-tools td:nth-child(4) {width:26%;}
+.mcp-tools th:nth-child(5),.mcp-tools td:nth-child(5) {width:8%;}
+.ns-mcp-dialog {width:min(1000px,calc(100vw - 48px));max-height:85vh;overflow:auto;box-sizing:border-box;padding:24px;border:1px solid var(--color-border,#ccc);border-radius:6px;background:var(--color-body-bg,#fff);color:var(--color-body-text,#000);}
+.ns-mcp-dialog::backdrop {background:#0007;}
+.ns-mcp-close {float:right;padding:6px 12px;}
+.ns-mcp-dialog pre {white-space:pre-wrap;overflow-wrap:anywhere;}
+.mcp-result {max-height:50vh;overflow:auto;padding:12px;border:1px solid var(--color-border,#ccc);}
+.mcp-followups button {margin:4px 8px 4px 0;}
+.ns-mcp-dialog .data-table {table-layout:auto;}
+.ns-mcp-dialog .data-table th:first-child,.ns-mcp-dialog .data-table td:first-child {width:auto;}
+.ns-scope {font-size:11px;white-space:nowrap;opacity:.75;}
+.ns-server-context {padding:8px 15px;font-size:13px;background:var(--color-secondary-bg,#f1f1f1);color:var(--color-body-text,#000);}
+.ns-directory li a {display:flex;justify-content:space-between;gap:12px;}
+.ns-directory-filter {display:block;margin-bottom:16px;}
+.ns-directory-filter select {padding:8px;font:inherit;}
+.ns-directory {display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:20px;}
+.ns-directory section {border:1px solid var(--color-border,#ccc);padding:16px;border-radius:4px;}
+.ns-directory li {margin:12px 0;}
+.ns-directory-search {display:block;margin:0 0 20px;}
+.ns-directory-search input {display:block;box-sizing:border-box;width:100%;max-width:480px;padding:10px;margin-top:6px;font:inherit;}
+@media(max-width:800px) {
+ .ns-nav-desktop {display:none;}
+ .ns-nav-mobile {display:block;}
+ .ns-nav-items {position:static;box-shadow:none;min-width:0;}
+ .ns-nav-group {border-top:1px solid #ffffff40;}
+ .ns-navigation summary {padding:14px 8px;}
+ .ns-directory {grid-template-columns:1fr;}
+}
+</style>}
+}
 
 set ::titles {
+    index             "Main menu"
+    dbpools           "Database pools"
     background.jobs   "Jobs"
     background.sched  "Scheduled Procedures"
     config.file       "Configuration File"
@@ -105,6 +280,7 @@ set ::titles {
     mem.cache         "Cache Statistics (ns_cache)"
     mem.nsvsize       "Shared Variable Statistics (nsv)"
     mem.tcl           "Allocated Memory"
+    mcp               "MCP configuration and tools"
     process           "Process Information"
     proxy-workers     "nsproxy Workers"
     requestprocs      "Request Handlers"
@@ -250,12 +426,14 @@ div.methodfilter .w3-check { width: 12px; height: 12px; top: 2px; }
 div.methodfilter label { margin-right: 6px; }
 </style>
 <%= $::extraHeadEntries %>
+<%= [_ns_stats.navigation.style] %>
 </head>
 
 <body>
+<%= [_ns_stats.navigation] %>
   <table class='navbar table table-responsive w-100 d-block d-md-table'>
     <tr>
-      <td valign='middle'><b><%= $::nav %></b></td>
+      <td valign='middle'><b><%= [_ns_stats.navigation.breadcrumb] %></b></td>
       <td valign='middle' align='right'>Raw: <a class='current' href='<%= $::rawUrl %>'><%= $::rawLabel %></a>
        &middot; <b><%= [_ns_stats.fmtTime [ns_time]] %></b></td>
     </tr>
@@ -271,34 +449,533 @@ proc _ns_stats.footer {} {
 }
 
 proc _ns_stats.index {} {
-    set linkLines ""
-    set level 0
-    foreach {name label} $::navLinks {
-        if {[string match *.* $name]} {
-            if {$level == 0} {
-                lappend linkLines "<ul>"
-                incr level
-            }
-        } else {
-            if {$level > 0} {
-                lappend linkLines </ul>
-                incr level -1
-            }
+    _ns_stats.header
+    set html {<label class='ns-directory-search'>Find a page<input type='search' id='ns-directory-search' placeholder='Search pages' aria-controls='ns-directory'></label><label class='ns-directory-filter'>Scope <select id='ns-directory-scope' aria-controls='ns-directory'><option value='all'>All scopes</option><option value='global'>Global</option><option value='server'>Current server</option></select></label><div class='ns-directory' id='ns-directory'>}
+    dict for {group definition} [_ns_stats.navigation.groups] {
+        lassign $definition label entries
+        append html "<section id='nav-$group'><h3>[ns_quotehtml $label]</h3><ul>"
+        foreach {target title} $entries {
+            set scope [_ns_stats.navigation.scope $target]
+            append html "<li data-scope='$scope'><a href='[_ns_stats.navigation.url $target]'><span>[ns_quotehtml $title]</span><span class='ns-scope'>[_ns_stats.navigation.scopeLabel $scope]</span></a></li>"
         }
-        if {[info procs _ns_stats.$name] ne ""} {
-            lappend linkLines  "<li> <a href='?@page=$name$::rawparam'>$label</a></li>"
+        append html "</ul></section>"
+    }
+    append html {</div><script>
+(function () {
+ const input = document.getElementById('ns-directory-search');
+ const directory = document.getElementById('ns-directory');
+ const scope = document.getElementById('ns-directory-scope');
+ function filterPages() {
+   const query = input.value.trim().toLowerCase();
+   directory.querySelectorAll('section').forEach(function (section) {
+     let visible = false;
+     section.querySelectorAll('li').forEach(function (item) {
+       const matchesScope = scope.value === 'all' || item.dataset.scope === scope.value || item.dataset.scope === 'mixed';
+       item.hidden = !matchesScope || !(section.querySelector('h3').textContent + ' ' + item.textContent).toLowerCase().includes(query);
+       visible = visible || !item.hidden;
+     });
+     section.hidden = !visible;
+   });
+ }
+ input.addEventListener('input', filterPages);
+ scope.addEventListener('change', filterPages);
+})();
+</script>}
+    _ns_stats.footer
+    return $html
+}
+
+proc _ns_stats.dbpools {} {
+    _ns_stats.header "Database pools"
+    set rows [_ns_stats.process.dbpools]
+    if {$rows eq ""} {
+        set html "<p>Database pool statistics are unavailable.</p>"
+    } else {
+        set html "<p>Database pool statistics are process-wide. A pool can be shared by multiple virtual servers; Process shows which pools each server can access.</p><table class='data'><tbody>[join $rows \n]</tbody></table>"
+    }
+    _ns_stats.footer
+    return $html
+}
+
+#
+# MCP administration is read-only and uses the normal nsstats access checks.
+# Configuration and credential fields are explicitly selected so secret values
+# and token digests never enter the rendered page.
+#
+proc _ns_stats.mcp.toolSummary {tool} {
+    # Short admin summaries; full MCP discovery descriptions remain available.
+    switch -- [dict get $tool name] {
+        server_describe {return "Basic runtime and package versions."}
+        configuration {return "Inspect configuration, policy scripts, limits and pool settings; redact credentials."}
+        server_topology {return "Versions, loaded modules and server configuration."}
+        server_runtime {return "Current gauges or sampled rates, timings and CPU usage."}
+        server_history {return "Persisted runtime samples and their coverage."}
+        smtp_logs {return "Inspect recent SMTP send results and session events."}
+        log_errors {return "Search the system log for errors."}
+        log_request_context {return "Correlate log entries by request or thread identifier."}
+        log_results {return "Check a search job or read a redacted result page."}
+        access_summary {return "Summarize traffic, status codes, timings and peer bursts."}
+        default {return [dict get $tool description]}
+    }
+}
+
+proc _ns_stats.mcp.toolExample {name} {
+    switch -- $name {
+        server_describe {return "Use server_describe to report runtime and package versions."}
+        configuration {return "Use configuration with scope process and follow nextArguments to inspect current settings across all virtual servers. Pair with server_topology and server_runtime for configuration and scaling advice."}
+        server_topology {return "Use server_topology to report NaviServer, Tcl, platform and loaded module versions."}
+        server_runtime {return "Use server_topology and server_runtime with mode snapshot. Show pool limits, active and waiting requests, and cumulative counters."}
+        server_history {return "Use server_history for the last five completed minutes. Follow all pages using nextArguments and report coverage, gaps, restarts and write failures."}
+        smtp_logs {return "Use smtp_logs with log event for the last 15 minutes. Show SMTP deferrals, rejections, TLS failures and transaction outcomes; include coverage."}
+        log_errors {return "Use log_errors to search for errors, then poll log_results with the returned jobHandle and read the result pages."}
+        log_request_context {return "Use log_request_context with the identifier from the selected log entry. Retrieve the correlated system and access records using log_results."}
+        log_results {return "Use log_results with the jobHandle from the preceding search. When complete, use its resultHandle to retrieve a result page."}
+        access_summary {return "Use access_summary for the last ten completed minutes. Show request frequency, status and pool distributions, timing averages and coverage."}
+        default {return ""}
+    }
+}
+
+# Use the existing nsstats access check; no bearer credentials are exposed or
+# stored by this interface. Bind handles and the POST token to this admin.
+proc _ns_stats.mcp.identity {} {
+    set identity [ns_conn authuser]
+    if {[info commands ad_conn] ne "" && ![catch {ad_conn user_id} userId] && $userId > 0} {
+        set identity "openacs:$userId"
+    } elseif {$identity eq ""} {
+        set identity "peer:[ns_conn peeraddr -source direct]"
+    }
+    return "nsstats:[ns_info server]:$identity"
+}
+
+proc _ns_stats.mcp.token {} {
+    set key mcp-inspect:[_ns_stats.mcp.identity]
+    if {![nsv_exists _ns_stats $key]} {
+        nsv_set _ns_stats $key [ns_crypto::randombytes -encoding hex 32]
+    }
+    return [nsv_get _ns_stats $key]
+}
+
+# This handler is reached only after the normal nsstats authorization check.
+# Require a POST and a page-issued token before passing the exact JSON-RPC body
+# through MCP's protocol, validation, authorization and result handling.
+proc _ns_stats.mcp.inspect {} {
+    if {[ns_conn method] ne "POST"} {
+        ns_return 405 text/plain "Use POST for tool inspection."
+        return ""
+    }
+    set key mcp-inspect:[_ns_stats.mcp.identity]
+    set token [ns_set iget [ns_conn headers] X-Nsstats-MCP-Token]
+    if {$token eq "" || ![nsv_exists _ns_stats $key] || $token ne [nsv_get _ns_stats $key]} {
+        ns_return 403 text/plain "Invalid inspection token; reload the MCP page."
+        return ""
+    }
+    if {[info commands ::nsmcp::protocol] eq ""} {
+        ns_return 503 text/plain "MCP protocol is not initialized."
+        return ""
+    }
+    # nsstats routes POST requests through ns_queryget/ns_getform. Keep the
+    # page selector and JSON-RPC payload together in the submitted form.
+    set body [ns_queryget mcpRequest ""]
+    if {[string bytelength $body] > 131072} {
+        ns_return 413 text/plain "Inspection request is too large."
+        return ""
+    }
+    # Limit this administration endpoint to tools/call. Protocol.handle performs
+    # the full JSON-RPC validation, including duplicate-member checks.
+    if {[catch {
+        set request [ns_json parse -- $body]
+        if {[dict get $request method] ne "tools/call"} {
+            error "Expected tools/call"
+        }
+    }]} {
+        ns_return 400 text/plain "Supply a JSON-RPC tools/call request."
+        return ""
+    }
+    set server [ns_info server]
+    set permissions {diagnostics.logs.peers.read diagnostics.configuration.process.read}
+    foreach tool [::nsmcp::tools describe] {
+        lappend permissions [dict get $tool permission]
+    }
+    set context [::nsmcp::RequestContext new -principal [_ns_stats.mcp.identity] \
+        -permissions [lsort -unique $permissions] -targets [list $server] -server $server]
+    try {
+        set response [::nsmcp::protocol handle $context $body]
+        ns_set iupdate [ns_conn outputheaders] Cache-Control no-store
+        ns_return [dict get $response status] application/json [dict get $response body]
+    } finally {
+        $context destroy
+    }
+    return ""
+}
+
+proc _ns_stats.mcp.arguments {schema} {
+    set rows {}
+    set required {}
+    if {[dict exists $schema required]} {
+        set required [dict get $schema required]
+    }
+    if {[dict exists $schema properties]} {
+        dict for {name property} [dict get $schema properties] {
+            set type [expr {[dict exists $property type] ? [dict get $property type] : ""}]
+            set description [expr {[dict exists $property description] ? [dict get $property description] : ""}]
+            foreach key {default minimum maximum enum} {
+                if {[dict exists $property $key]} {
+                    append description " $key: [dict get $property $key]."
+                }
+            }
+            lappend rows [list $name $type [expr {$name in $required ? "Yes" : "No"}] [string trim $description]]
+        }
+    }
+    if {$rows eq ""} {
+        set html "<p>No named arguments.</p>"
+    } else {
+        set html [_ns_stats.mcp.table Arguments {Argument Type Required Description} $rows]
+    }
+    if {[dict exists $schema oneOf] || [dict exists $schema anyOf]} {
+        append html "<p>Argument combinations have additional requirements; see the input schema.</p>"
+    }
+    append html "<details><summary>Input schema</summary><pre>[ns_quotehtml $schema]</pre></details>"
+    return $html
+}
+
+proc _ns_stats.mcp.table {heading columns rows} {
+    set dialogs ""
+    set rowIndex 0
+    set classes "data data-table mcp w3-table w3-hoverable"
+    if {"Tool name" in $columns} {
+        append classes " mcp-tools"
+    }
+    set html "<h3>[ns_quotehtml $heading]</h3><div class='w3-responsive'><table class='$classes'><thead><tr>"
+    foreach column $columns {
+        append html "<th>[ns_quotehtml $column]</th>"
+    }
+    append html "</tr></thead><tbody>"
+    foreach row $rows {
+        append html "<tr>"
+        set index 0
+        foreach value $row {
+            set content [ns_quotehtml $value]
+            if {[lindex $columns $index] eq "Tool name"} {
+                set content "<code>$content</code>"
+            }
+            if {[lindex $columns $index] eq "Tool details"} {
+                lassign $value description schema example token
+                set id ns-mcp-tool-$rowIndex
+                set title [ns_quotehtml [lindex $row 0]]
+                set content "<button type='button' data-mcp-dialog='$id' aria-haspopup='dialog'>Details</button>"
+                append dialogs "<dialog class='ns-mcp-dialog' id='$id' aria-labelledby='$id-title'><form method='dialog'><button class='ns-mcp-close' aria-label='Close tool details'>Close</button></form><h3 id='$id-title'>$title</h3><p>[ns_quotehtml $description]</p>"
+                append dialogs [_ns_stats.mcp.arguments $schema]
+                if {$token ne ""} {
+                    append dialogs "<details class='mcp-inspect' data-tool='$title' data-token='[ns_quotehtml $token]'><summary>Inspect result</summary><p>Edit JSON arguments and run this tool. Results use the admin identity; handles belong to this identity. Peer disclosure is available to this trusted admin interface when requested.</p><label>Arguments (JSON)<textarea class='mcp-arguments' rows='6' style='box-sizing:border-box;width:100%'>{}</textarea></label><button type='button' class='mcp-run'>Run tool</button> <button type='button' class='mcp-reset'>Reset arguments</button><p class='mcp-inspect-status' role='status'></p><div class='mcp-followups'></div><details class='mcp-response' hidden><summary>Tool result</summary><button type='button' class='mcp-copy'>Copy complete response</button> <button type='button' class='mcp-download'>Download complete response</button><pre class='mcp-result' tabindex='0'></pre><details class='mcp-envelope'><summary>Complete JSON-RPC response</summary><pre class='mcp-result mcp-raw-result' tabindex='0'></pre></details></details></details>"
+                }
+                if {$example ne ""} {
+                    append dialogs "<h4>Example query</h4><textarea readonly rows='4' aria-label='Example query' style='box-sizing:border-box;width:100%'>[ns_quotehtml $example]</textarea>"
+                }
+                append dialogs "</dialog>"
+            }
+            if {[lindex $columns $index] eq "Argument schema"} {
+                set content "<details><summary>Arguments</summary><div>$content</div></details>"
+            }
+            append html "<td style='overflow-wrap:anywhere;vertical-align:top'>$content</td>"
+            incr index
+        }
+        append html "</tr>"
+        incr rowIndex
+    }
+    append html "</tbody></table></div>" $dialogs
+    if {$dialogs ne ""} {
+        append html {<script>
+(function () {
+ document.querySelectorAll('[data-mcp-dialog]').forEach(function (button) {
+   button.addEventListener('click', function () {
+     document.getElementById(button.dataset.mcpDialog).showModal();
+   });
+ });
+ document.querySelectorAll('.ns-mcp-dialog').forEach(function (dialog) {
+   dialog.addEventListener('click', function (event) {
+     if (event.target !== dialog) return;
+     const bounds = dialog.getBoundingClientRect();
+     if (event.clientX < bounds.left || event.clientX > bounds.right ||
+         event.clientY < bounds.top || event.clientY > bounds.bottom) dialog.close();
+   });
+ });
+})();
+</script>}
+    }
+    if {$dialogs ne ""} {
+        append html [_ns_stats.mcp.inspectionScript]
+    }
+    return $html
+}
+
+proc _ns_stats.mcp.inspectionScript {} {
+    return {<script>
+(function () {
+ document.querySelectorAll('.mcp-inspect').forEach(function (panel) {
+   const input = panel.querySelector('.mcp-arguments');
+   const status = panel.querySelector('.mcp-inspect-status');
+   const result = panel.querySelector('.mcp-result');
+   const responsePanel = panel.querySelector('.mcp-response');
+   const rawResult = panel.querySelector('.mcp-raw-result');
+   const envelopePanel = panel.querySelector('.mcp-envelope');
+   const followups = panel.querySelector('.mcp-followups');
+   const runButton = panel.querySelector('.mcp-run');
+   let json = '', currentTool = panel.dataset.tool;
+   runButton.textContent = 'Run ' + currentTool;
+   function offer(label, tool, args) {
+     const button = document.createElement('button');
+     button.type = 'button'; button.textContent = label;
+     button.addEventListener('click', function () {
+       input.value = JSON.stringify(args, null, 2);
+       run(tool, args);
+     });
+     followups.appendChild(button);
+   }
+   async function run(tool, args) {
+     currentTool = tool; runButton.textContent = 'Run ' + tool;
+     runButton.disabled = true; panel.querySelector('.mcp-reset').disabled = true; status.textContent = 'Running ' + tool + '…';
+     followups.replaceChildren(); responsePanel.hidden = true; json = '';
+     try {
+       const url = new URL(window.location.href);
+       url.searchParams.set('@page', 'mcp'); url.searchParams.set('mcpInspect', '1');
+       url.hash = '';
+       const response = await fetch(url, {
+         method: 'POST', credentials: 'same-origin', cache: 'no-store',
+         headers: {'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8', 'X-Nsstats-MCP-Token': panel.dataset.token},
+         body: new URLSearchParams({
+           '@page':'mcp', mcpInspect:'1',
+           mcpRequest:JSON.stringify({jsonrpc:'2.0', id:1, method:'tools/call', params:{name:tool, arguments:args}})
+         }).toString()
+       });
+       const body = await response.text();
+       let envelope;
+       try { envelope = JSON.parse(body); }
+       catch (error) { throw new Error('HTTP ' + response.status + ': ' + body); }
+       json = JSON.stringify(envelope, null, 2); rawResult.textContent = json;
+       const displayed = envelope.error || (envelope.result && envelope.result.structuredContent) || envelope.result || envelope;
+       result.textContent = JSON.stringify(displayed, null, 2); envelopePanel.open = false;
+       responsePanel.hidden = false; responsePanel.open = true; currentTool = tool;
+       status.textContent = envelope.error ? 'MCP returned an error.' : 'Response received from ' + tool + '.';
+       const data = envelope.result && envelope.result.structuredContent;
+       if (!data) return;
+       if (data.jobHandle && data.status !== 'complete') {
+         offer('Poll job', 'log_results', {jobHandle:data.jobHandle});
+       }
+       if (data.nextArguments) offer('Next history page', 'server_history', data.nextArguments);
+       const handles = new Set();
+       function pages(value, path) {
+         if (!value || typeof value !== 'object') return;
+         if (typeof value.resultHandle === 'string' && (!value.records || value.more) && !handles.has(value.resultHandle)) {
+           handles.add(value.resultHandle);
+           const next = {resultHandle:value.resultHandle, limit:args.limit || 20};
+           if (args.includePeerAddresses === true) next.includePeerAddresses = true;
+           if (value.more && value.nextCursor !== '' && value.nextCursor != null) next.cursor = value.nextCursor;
+           offer((next.cursor != null ? 'Next page' : 'Read results') + (path ? ' (' + path + ')' : ''), 'log_results', next);
+         }
+         Object.keys(value).forEach(key => pages(value[key], path ? path + '.' + key : key));
+       }
+       pages(data, '');
+     } catch (error) {
+       status.textContent = error.message;
+     } finally { runButton.disabled = false; panel.querySelector('.mcp-reset').disabled = false; }
+   }
+   runButton.addEventListener('click', function () {
+     try {
+       const args = JSON.parse(input.value);
+       if (!args || Array.isArray(args) || typeof args !== 'object') throw new Error('Arguments must be a JSON object.');
+       run(currentTool, args);
+     } catch (error) { status.textContent = error.message; }
+   });
+   panel.querySelector('.mcp-reset').addEventListener('click', function () {
+     currentTool = panel.dataset.tool; input.value = '{}'; runButton.textContent = 'Run ' + currentTool;
+     followups.replaceChildren(); status.textContent = 'Arguments reset; no call made.';
+   });
+   panel.querySelector('.mcp-copy').addEventListener('click', async function () {
+     try { await navigator.clipboard.writeText(json); status.textContent = 'JSON copied.'; }
+     catch (error) { status.textContent = 'Copy unavailable; select the response text to copy it.'; }
+   });
+   panel.querySelector('.mcp-download').addEventListener('click', function () {
+     const url = URL.createObjectURL(new Blob([json], {type:'application/json'}));
+     const link = document.createElement('a'); link.href = url; link.download = currentTool + '.json';
+     link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+   });
+ });
+})();
+</script>}
+}
+
+proc _ns_stats.mcp {} {
+    if {[info commands ::nsmcp::ToolRegistry] eq ""} {
+        return "[_ns_stats.header MCP]<p>The nsmcp module is not active.</p>[_ns_stats.footer]"
+    }
+    if {[ns_queryget mcpInspect ""] ne ""} {
+        return [_ns_stats.mcp.inspect]
+    }
+    set html [_ns_stats.header "MCP"]
+    set server [ns_info server]
+    set section ns/server/$server/module/nsmcp
+    append html "<p>Server: <strong>[ns_quotehtml $server]</strong>. Open Inspect result in a tool’s Details to execute it on demand; page loading does not execute tools. Configuration changes require the usual module initialization or restart.</p>"
+
+    if {[info commands ::nsmcp::tools] ne ""} {
+        if {[catch {::nsmcp::tools describe} tools]} {
+            append html "<p>Tool inspection unavailable; update nsmcp to provide registry describe.</p>"
         } else {
-            lappend linkLines  "<li> <strong>$label</strong></li>"
+            set rows {}
+            set token ""
+            if {[info commands ::nsmcp::protocol] ne ""} {
+                set token [_ns_stats.mcp.token]
+            }
+            foreach tool $tools {
+                lappend rows [list [dict get $tool name] "Registered" \
+                    [_ns_stats.mcp.toolSummary $tool] [dict get $tool permission] \
+                    [list [dict get $tool description] [dict get $tool inputSchema] \
+                        [_ns_stats.mcp.toolExample [dict get $tool name]] $token]]
+            }
+            append html "<p>Use these exact tool names in client queries. Open Details for arguments and a selectable example query.</p>"
+            append html [_ns_stats.mcp.table "Available tools" \
+                {{Tool name} Status Purpose {Required permission} {Tool details}} $rows]
         }
     }
 
-    append html \
-        [_ns_stats.header] \
-        <ul> \n \
-        [join $linkLines \n] \n \
-        </ul> \n \
-        [_ns_stats.footer]
+    set version Unknown
+    set tag Unknown
+    if {![catch {ns_server -server $server modules} modules]
+        && [dict exists $modules nsmcp]} {
+        set module [dict get $modules nsmcp]
+        foreach key {version tag} {
+            if {[dict exists $module $key] && [dict get $module $key] ne ""} {
+                set $key [dict get $module $key]
+            }
+        }
+    }
+    append html [_ns_stats.mcp.table "Module version" {Module Version {Build tag}} \
+        [list [list nsmcp $version $tag]]]
+    append html "<p>Version and build tag come from NaviServer's loaded-module metadata. Unknown means the module does not report that information. Individual tools have no separate version.</p>"
 
+    set objects {
+        auth Authentication {Authenticate bearer tokens.}
+        credentials Credentials {Load named token files and permission policies.}
+        server {HTTP endpoint} {Receive MCP HTTP requests.}
+        database {SQLite cache} {Store bounded analytics data.}
+        logService {Log service} {Manage log searches, correlation and redaction.}
+        accessAnalytics {Access analytics} {Ingest and aggregate access-log records.}
+    }
+    set rows {}
+    foreach {name label purpose} $objects {
+        set present [expr {[info commands ::nsmcp::$name] ne ""}]
+        lappend rows [list $label [expr {$present ? "Initialized" : "Not initialized"}] $purpose]
+    }
+    append html [_ns_stats.mcp.table "Runtime components" {Component Status Purpose} $rows]
+    append html "<p>Initialized means the component object exists; it is not a health or coverage guarantee.</p>"
+
+    foreach {heading options} {
+        {HTTP and authentication} {
+            enableHttp false path /mcp allowedOrigins {} credentials {}
+        }
+        {Log tools} {
+            enableLogTools false systemLog {} accessLog {} cacheDirectory {}
+        }
+        {SMTP log tools} {
+            enableSmtpTools false smtpLogReadBytes 1MiB
+        }
+        {Access analytics and database} {
+            enableAccessAnalytics false databasePool {} databaseMaxBytes 1GiB
+            accessIngestInterval 5s accessMaxRows 2000000 accessRetention 24h
+            accessTimingColumn -1
+        }
+        {Runtime diagnostics and history} {
+            enableStatsTools true
+        }
+    } {
+        set rows {}
+        foreach {key default} $options {
+            set configured [ns_config $section $key ""]
+            if {$configured eq ""} {
+                lappend rows [list $key $default "Default / unset"]
+            } else {
+                lappend rows [list $key $configured "Configured"]
+            }
+        }
+        append html [_ns_stats.mcp.table $heading {Parameter Value Source} $rows]
+    }
+
+    set rows {}
+    foreach {key default} [list server [lindex [ns_info servers] 0] \
+                              sampling false samplingInterval 10s \
+                              historyPool {} historyRetention 24h historyMaxBytes 64MiB] {
+        set value [ns_config ns/stats $key $default]
+        lappend rows [list $key $value]
+    }
+    append html [_ns_stats.mcp.table "Core diagnostics startup settings (ns/stats)" {Parameter Value} $rows]
+    append html "<p>Sampling and persistence are configured by ns_stats, independently of MCP. Runtime status below may differ from startup settings.</p>"
+
+    set rows {}
+    foreach {object properties} {
+        server {path}
+        http {allowedOrigins maxBodyBytes}
+        database {pool maxBytes}
+        logService {queue lifetime maxJobs}
+        accessAnalytics {path maxRows retentionSeconds maxReadBytes maxLineBytes maxSeconds}
+    } {
+        set command ::nsmcp::$object
+        if {[info commands $command] eq ""} {
+            continue
+        }
+        foreach property $properties {
+            if {![catch {$command cget -$property} value]} {
+                lappend rows [list $object $property $value]
+            }
+        }
+    }
+    append html [_ns_stats.mcp.table "Active component settings" {Component Setting Value} $rows]
+    append html "<p>Active component settings reflect initialized objects; configuration tables above show startup values and defaults.</p>"
+
+    if {[info commands ::nsmcp::logDiscovery] ne ""} {
+        if {[catch {::nsmcp::logDiscovery discover} discovery]} {
+            append html "<p>Log discovery unavailable.</p>"
+        } else {
+            set rows {}
+            foreach kind {system access} {
+                set entry [dict get $discovery $kind]
+                lappend rows [list $kind [dict get $entry path] [dict get $entry origin] \
+                    [dict get $entry exists] [dict get $entry readable]]
+            }
+            append html [_ns_stats.mcp.table "Discovered logs" {Log Path Origin Exists Readable} $rows]
+        }
+    }
+
+    if {[info commands ::nsmcp::credentials] ne ""} {
+        if {[catch {::nsmcp::credentials describe} credentials]} {
+            append html "<p>Credential policy status unavailable.</p>"
+        } else {
+            set rows {}
+            dict for {name entry} $credentials {
+                set row [list $name]
+                foreach key {principal permissions targets expires status tokenFile} {
+                    lappend row [expr {[dict exists $entry $key] ? [dict get $entry $key] : "unknown"}]
+                }
+                lappend rows $row
+            }
+            append html [_ns_stats.mcp.table "Credential policies" \
+                {Name Principal Permissions Servers {Expiry epoch (0: none)} Status {Token file path}} $rows]
+            append html "<p>Token contents and digests are omitted. Tool visibility depends on each credential's permissions.</p>"
+        }
+    }
+
+    if {[info commands ::ns_stats] ne ""} {
+        foreach {command heading} {sampling Sampling history {History persistence}} {
+            if {[catch {ns_stats $command status} status]} {
+                append html "<p>[ns_quotehtml $heading] status unavailable.</p>"
+            } else {
+                set rows {}
+                dict for {key value} $status {
+                    lappend rows [list $key $value]
+                }
+                append html [_ns_stats.mcp.table $heading {Metric Value} $rows]
+            }
+        }
+    }
+    append html [_ns_stats.footer]
     return $html
 }
 
@@ -523,24 +1200,349 @@ proc _ns_stats.mem.cache {} {
     return $html
 }
 
-proc _ns_stats.requestRates {sampleKey} {
-    set total        0
-    set serverCounts {}
-
-    foreach server [ns_info servers] {
-        set requests 0
-
-        foreach pool [ns_server -server $server pools] {
-            incr requests \
-                [dict get [ns_server -server $server -pool $pool stats] requests]
-        }
-
-        dict set serverCounts $server $requests
-        incr total $requests
+# Prefer a ready shared sample while sampling runs; allow an explicit snapshot.
+# Neither read changes sampling. An absent command selects the legacy collector.
+proc _ns_stats.runtimeSnapshot {} {
+    if {[info commands ::ns_stats] eq ""} {
+        return {}
     }
+    set mode auto
+    if {[info commands ns_queryget] ne ""} {
+        set mode [ns_queryget statsMode auto]
+    }
+    if {$mode ni {auto snapshot}} {
+        set mode auto
+    }
+    set status [ns_stats sampling status]
+    if {$mode eq "auto" && [dict get $status running]} {
+        set sample [ns_stats sample]
+        if {[dict get $sample sampling ready]} {
+            dict set sample collectorMode sample
+            dict set sample samplingStatus $status
+            return $sample
+        }
+    }
+    set snapshot [ns_stats snapshot]
+    dict set snapshot collectorMode snapshot
+    dict set snapshot samplingStatus $status
+    return $snapshot
+}
 
+proc _ns_stats.sampled {snapshot} {
+    return [expr {[dict exists $snapshot collectorMode] && [dict get $snapshot collectorMode] eq "sample"}]
+}
+
+# Reconstruct only the preceding counter values needed by the existing tables.
+# Unknown/reset deltas produce decreased counters and remain unknown in renderers.
+proc _ns_stats.utilization.samplePrevious {current snapshot} {
+    set previous $current
+    dict for {thread data} [dict get $snapshot drivers] {
+        dict for {key value} [dict get $data counters] {
+            set delta [_ns_stats.dictGetDef $data deltas $key {}]
+            dict set previous drivers $thread $key [expr {$delta eq "" ? $value+1 : $value-$delta}]
+        }
+    }
+    dict for {server data} [dict get $snapshot servers] {
+        dict for {pool entry} [dict get $data pools] {
+            dict for {key value} [dict get $entry counters] {
+                if {![string is double -strict $value]} continue
+                set delta [_ns_stats.dictGetDef $entry deltas $key {}]
+                dict set previous servers $server pools $pool stats $key [expr {$delta eq "" ? $value+1 : $value-$delta}]
+            }
+        }
+    }
+    dict set previous timestamp [expr {[dict get $snapshot timestamp]-int([dict get $snapshot sampling elapsedSeconds]*1000000)}]
+    return $previous
+}
+
+proc _ns_stats.utilization.sampleTotal {snapshot role key} {
+    set total 0.0
+    dict for {server data} [dict get $snapshot servers] {
+        dict for {pool entry} [dict get $data pools] {
+            set value [_ns_stats.dictGetDef $entry $role $key {}]
+            if {$value eq ""} {return -1.0}
+            set total [expr {$total+$value}]
+        }
+    }
+    return $total
+}
+
+# Source controls do not start/stop sampling or configure persistence.
+proc _ns_stats.utilization.sourcePanel {sample {page utilization}} {
+    set snapshot [_ns_stats.dictGetDef $sample coreSnapshot {}]
+    if {$snapshot eq ""} {return {}}
+    set status [_ns_stats.dictGetDef $snapshot samplingStatus {}]
+    set sampled [_ns_stats.sampled $snapshot]
+    set label [expr {$sampled ? "Shared interval sample" : "Live snapshot"}]
+    set details "Gauges are observations at collection time."
+    if {$sampled} {
+        set age [dict get $snapshot sampling ageSeconds]
+        set interval [dict get $snapshot sampling elapsedSeconds]
+        set details "Sample age: [format %.2f $age]s; measured interval: [format %.3f $interval]s. Rates and CPU use this interval, independently of page refreshes."
+        if {$age>2*[dict get $status interval]} {
+            append details " <strong>Sample is stale.</strong>"
+        }
+    } elseif {[_ns_stats.dictGetDef $status running false]} {
+        append details " Sampling is running; the first usable interval is not ready, or live snapshot was selected."
+    } else {
+        append details " Sampling is stopped; rates use page observations."
+    }
+    set selectedAuto [expr {$sampled || [ns_queryget statsMode auto] ne "snapshot" ? " selected" : ""}]
+    set selectedSnapshot [expr {$selectedAuto eq "" ? " selected" : ""}]
+    return "<p><strong>$label.</strong> $details Collection time: [clock format [expr {[dict get $snapshot timestamp]/1000000}] -format {%Y-%m-%d %H:%M:%S %Z}].</p><form method='get'><input type='hidden' name='@page' value='[ns_quotehtml $page]'><label>Measurements <select name='statsMode'><option value='auto'$selectedAuto>Use shared sampling when running</option><option value='snapshot'$selectedSnapshot>Live snapshot / page interval</option></select></label> <button type='submit'>Apply</button></form>"
+}
+
+# Reduce stored records to plot/table data while paging, rather than retaining
+# thousands of complete thread/driver snapshots in the page interpreter.
+proc _ns_stats.utilization.historyPoint {record} {
+    set ready [dict get $record sampling ready]
+    set requests -1.0
+    set poolRates {}
+    dict for {server data} [dict get $record servers] {
+        dict for {pool entry} [dict get $data pools] {
+            set rate [_ns_stats.dictGetDef $entry rates requests {}]
+            dict set poolRates $server/$pool $rate
+        }
+    }
+    if {$ready} {set requests [_ns_stats.utilization.sampleTotal $record rates requests]}
+    set n [_ns_stats.utilization.sampleTotal $record deltas requests]
+    set timings {}
+    foreach key {queuetime filtertime runtime tracetime} {
+        set total [_ns_stats.utilization.sampleTotal $record deltas $key]
+        dict set timings $key [expr {$ready && $n>0 && $total>=0 ? 1000.0*$total/$n : -1.0}]
+    }
+    set groups [_ns_stats.dictGetDef $record cpuPercent groups {}]
+    set cpu -1.0
+    if {$ready && $groups ne ""} {
+        set cpu 0.0
+        dict for {group value} $groups {set cpu [expr {$cpu+$value}]}
+    }
+    return [dict create timestamp [dict get $record timestamp] instance [dict get $record instance] \
+        sampling [dict get $record sampling] requests $requests pools $poolRates timings $timings cpu $cpu groups $groups]
+}
+
+proc _ns_stats.utilization.readHistory {minutes} {
+    set to [clock seconds]
+    set from [expr {$to-$minutes*60}]
+    set status [ns_stats history status]
+    set source memory
+    if {[_ns_stats.dictGetDef $status pool {}] ne ""} {
+        if {[dict get $status owner] ne [ns_info server]} {
+            return [dict create available false reason "Persistent history belongs to virtual server '[dict get $status owner]'; open nsstats there."]
+        }
+        set source sqlite
+    }
+    set points {}
+    set cursor 0
+    set coverage {}
+    set gaps {}
+    set restarts {}
+    set events {}
+    set resets 0
+    set overlap false
+    set more true
+    set pages 0
+    # Bound request work; at ten-second cadence this covers a full day.
+    while {$more && [llength $points]<10000} {
+        if {$source eq "sqlite"} {
+            set page [ns_stats history query -from $from -to $to -limit 1000 -cursor $cursor]
+        } else {
+            set page [ns_stats sampling history -from $from -to $to -limit 180 -cursor $cursor]
+        }
+        incr pages
+        foreach record [dict get $page records] {
+            lappend points [_ns_stats.utilization.historyPoint $record]
+        }
+        set current [dict get $page coverage]
+        set gaps [concat $gaps [_ns_stats.dictGetDef $current gaps {}]]
+        set restarts [concat $restarts [_ns_stats.dictGetDef $current restartBoundaries {}]]
+        set events [concat $events [_ns_stats.dictGetDef $current events {}]]
+        incr resets [_ns_stats.dictGetDef $current resetSamples 0]
+        set overlap [expr {$overlap || [_ns_stats.dictGetDef $current evictionOrFailureOverlap false]}]
+        set coverage $current
+        set more [dict get $page more]
+        if {$more} {
+            set next [dict get $page nextCursor]
+            if {$next eq "" || $next<=$cursor} {error "History paging did not advance"}
+            set cursor $next
+        }
+    }
+    dict set coverage gaps [lsort -unique $gaps]
+    dict set coverage restartBoundaries [lsort -unique $restarts]
+    dict set coverage events [lsort -unique $events]
+    dict set coverage resetSamples $resets
+    dict set coverage evictionOrFailureOverlap $overlap
+    if {$pages>1 || $more} {dict set coverage complete false}
+    return [dict create available true source $source persistence $status points $points from $from to $to \
+        coverage $coverage truncated $more pages $pages]
+}
+
+# Produce literal JSON, including nulls for unknown observations and gaps.
+proc _ns_stats.utilization.historyChart {id title unit points kind} {
+    set names {Total}
+    if {$kind eq "pools"} {
+        set names {}
+        foreach point $points {set names [concat $names [dict keys [dict get $point pools]]]}
+        set names [lsort -unique $names]
+    } elseif {$kind eq "cpu"} {
+        set names {connection driver writer spooler other}
+    }
+    set series {}
+    set seriesIndex 0
+    foreach name $names {
+        set data {}
+        set index 0
+        set previous {}
+        foreach point $points {
+            set stamp [expr {[dict get $point timestamp]/1000}]
+            set sampling [dict get $point sampling]
+            if {$previous ne ""} {
+                set elapsed [expr {([dict get $point timestamp]-[dict get $previous timestamp])/1000000.0}]
+                if {[dict get $point instance] ne [dict get $previous instance]
+                    || $elapsed>1.5*max([dict get $sampling intervalSeconds],[dict get $previous sampling intervalSeconds])} {
+                    lappend data $index array [list 0 number [expr {[dict get $previous timestamp]/1000+1}] 1 null {}]
+                    incr index
+                }
+            }
+            set value {}
+            if {[dict get $sampling ready]} {
+                switch -- $kind {
+                    pools {set value [_ns_stats.dictGetDef $point pools $name {}]}
+                    cpu {set value [_ns_stats.dictGetDef $point groups $name {}]}
+                    default {set value [dict get $point requests]}
+                }
+            }
+            set type number
+            if {$value eq "" || $value<0} {set type null; set value {}}
+            lappend data $index array [list 0 number $stamp 1 $type $value]
+            incr index
+            set previous $point
+        }
+        lappend series $seriesIndex object [list name string $name data array $data]
+        incr seriesIndex
+    }
+    set config [list {} object [list chart object {type string line height number 300} \
+        title object [list text string $title] time object {useUTC boolean false} \
+        xAxis object {type string datetime} yAxis object [list title object [list text string $unit]] \
+        plotOptions object {series object {connectNulls boolean false marker object {enabled boolean false}}} \
+        series array $series]]
+    set json [string map [list < {\u003c} > {\u003e} & {\u0026}] [ns_json value -- $config]]
+    set jsonId [ns_json value -- [list {} string $id]]
+    return "<div id='[ns_quotehtml $id]' class='utilization-chart'></div><script>Highcharts.chart($jsonId,$json);</script>"
+}
+
+proc _ns_stats.utilization.historyPanel {} {
+    if {[info commands ::ns_stats] eq ""} {return {}}
+    set minutes [ns_queryget historyMinutes 15]
+    if {$minutes ni {15 60 360 1440}} {set minutes 15}
+    set options {}
+    foreach {value label} {15 {Last 15 minutes} 60 {Last hour} 360 {Last 6 hours} 1440 {Last 24 hours}} {
+        set selected [expr {$minutes==$value ? " selected" : ""}]
+        append options "<option value='$value'$selected>$label</option>"
+    }
+    set html "<h2>Recent sampled history</h2><form method='get'><input type='hidden' name='@page' value='utilization'><input type='hidden' name='statsMode' value='[ns_quotehtml [ns_queryget statsMode auto]]'><label>Period <select name='historyMinutes'>$options</select></label> <button type='submit'>Show history</button></form>"
+    if {[catch {_ns_stats.utilization.readHistory $minutes} result]} {
+        return "$html<p>History unavailable: [ns_quotehtml $result]</p>"
+    }
+    if {![dict get $result available]} {return "$html<p>[ns_quotehtml [dict get $result reason]]</p>"}
+    set points [dict get $result points]
+    set coverage [dict get $result coverage]
+    set source [dict get $result source]
+    set status [dict get $result persistence]
+    set label [expr {$source eq "sqlite" ? "Persistent SQLite history (including retained samples before restart)" : "Process memory: at most 180 samples / 15 minutes; lost on process restart"}]
+    append html "<p>[ns_quotehtml $label]. [llength $points] samples returned. No sampling or persistence settings are changed by this page.</p>"
+    set rows [list [list Source $label] \
+        [list "Paging complete" [expr {![dict get $result truncated]}]] \
+        [list "Coverage reported complete" [_ns_stats.dictGetDef $coverage complete false]] \
+        [list Gaps [llength [dict get $coverage gaps]]] \
+        [list "Restart boundaries" [llength [dict get $coverage restartBoundaries]]] \
+        [list "Baseline/reset samples" [dict get $coverage resetSamples]] \
+        [list "Eviction or failure overlap" [dict get $coverage evictionOrFailureOverlap]] \
+        [list "Dropped through (epoch microseconds)" [_ns_stats.dictGetDef $coverage droppedThrough {}]]]
+    if {$source eq "sqlite"} {
+        lappend rows [list "Persistence enabled" [dict get $status enabled]] \
+            [list "Write failures since persistence started" [dict get $status failures]]
+    }
+    foreach {key label} {retainedFrom {Oldest retained sample} retainedTo {Newest retained sample}} {
+        set value [_ns_stats.dictGetDef $coverage $key 0]
+        lappend rows [list $label [expr {$value>0 ? [clock format [expr {int($value)}] -format {%Y-%m-%d %H:%M:%S %Z}] : "unknown"}]]
+    }
+    append html [_ns_stats.results history-coverage 0 {Metric Value} {?@page=utilization} $rows 0 {left left}]
+    if {[dict get $result truncated]} {append html "<p><strong>History limited to 10,000 samples; select a shorter period.</strong></p>"}
+    if {$points eq ""} {return "$html<p>No retained samples in this interval. Start sampling to collect observations; enable persistence for longer history and restart survival.</p>"}
+    append html "<p>Rates and timings describe each measured sampling interval. Gauges describe its end. Missing/reset intervals are unknown; chart lines break across gaps and restarts. CPU percentages show measured thread groups relative to one core.</p>"
+    append html "<div class='utilization-charts'>" \
+        [_ns_stats.utilization.historyChart history-requests {Requests per second by server/pool} requests/s $points pools] \
+        [_ns_stats.utilization.historyChart history-cpu {Measured CPU by thread group} {CPU % of one core} $points cpu] "</div>"
+    set rows {}
+    foreach point [lreverse [lrange $points end-19 end]] {
+        set row [list [clock format [expr {[dict get $point timestamp]/1000000}] -format {%Y-%m-%d %H:%M:%S %Z}] \
+            [_ns_stats.dictGetDef $point sampling elapsedSeconds {}] \
+            [_ns_stats.utilization.displayRate [dict get $point requests]]]
+        foreach key {queuetime filtertime runtime tracetime} {
+            set value [dict get $point timings $key]
+            lappend row [expr {$value>=0 ? [format %.3f $value] : "unknown"}]
+        }
+        set cpu [dict get $point cpu]
+        lappend row [expr {$cpu>=0 ? [format %.1f $cpu] : "unknown"}]
+        lappend rows $row
+    }
+    append html "<h3>Latest 20 retained intervals</h3>" \
+        [_ns_stats.results history-intervals 0 {{Interval ending} {Seconds} {Requests/s} {Queue ms} {Filter ms} {Run ms} {Trace ms} {Measured CPU %}} {?@page=utilization} $rows 0 {left right right right right right right right}]
+    return $html
+}
+
+proc _ns_stats.requestCounts {} {
+    set snapshot [_ns_stats.runtimeSnapshot]
+    set total 0
+    set servers {}
+    if {$snapshot ne ""} {
+        dict for {server data} [dict get $snapshot servers] {
+            set count 0
+            dict for {pool entry} [dict get $data pools] {
+                incr count [dict get $entry counters requests]
+            }
+            dict set servers $server $count
+            incr total $count
+        }
+        set timestamp [dict get $snapshot timestamp]
+    } else {
+        foreach server [ns_info servers] {
+            set count 0
+            foreach pool [ns_server -server $server pools] {
+                incr count [dict get [ns_server -server $server -pool $pool stats] requests]
+            }
+            dict set servers $server $count
+            incr total $count
+        }
+        set timestamp [clock microseconds]
+    }
+    return [dict create timestamp $timestamp total $total servers $servers coreSnapshot $snapshot]
+}
+
+proc _ns_stats.requestRates {sampleKey} {
+    set counts       [_ns_stats.requestCounts]
+    set total        [dict get $counts total]
+    set serverCounts [dict get $counts servers]
     set linuxNetwork [_ns_stats.linuxNetworkSnapshot]
-    set now          [clock microseconds]
+    set now          [dict get $counts timestamp]
+
+    set snapshot [dict get $counts coreSnapshot]
+    if {[_ns_stats.sampled $snapshot]} {
+        set rates {}
+        dict for {server data} [dict get $snapshot servers] {
+            set totalRate 0.0
+            dict for {pool entry} [dict get $data pools] {
+                set value [_ns_stats.dictGetDef $entry rates requests {}]
+                if {$value eq ""} {set totalRate -1.0; break}
+                set totalRate [expr {$totalRate+$value}]
+            }
+            dict set rates $server $totalRate
+        }
+        return [dict create available 1 elapsed [dict get $snapshot sampling elapsedSeconds] \
+            total [_ns_stats.utilization.sampleTotal $snapshot rates requests] servers $rates \
+            linuxNetwork $linuxNetwork previousLinuxNetwork {}]
+    }
 
     set sample [dict create \
                     timestamp    $now \
@@ -605,12 +1607,7 @@ proc _ns_stats.requestRates {sampleKey} {
 }
 
 proc _ns_stats.totalRequests {} {
-    set totalRequests 0
-    foreach s [ns_info servers] {
-        foreach pool [ns_server -server $s pools] {
-            incr totalRequests [dict get [ns_server -server $s -pool $pool stats] requests]
-        }
-    }
+    set totalRequests [dict get [_ns_stats.requestCounts] total]
     if {$totalRequests == 0} {
         # avoid division by 0
         incr totalRequests
@@ -624,10 +1621,33 @@ proc _ns_stats.utilizationSample {} {
     set queues  {}
     set servers {}
 
-    foreach stats [ns_driver stats] {
-        dict set drivers [dict get $stats thread] $stats
+    set snapshot [_ns_stats.runtimeSnapshot]
+    set collector legacy
+    if {$snapshot ne ""} {
+        set collector [expr {[_ns_stats.sampled $snapshot] ? "ns_stats-sample" : "ns_stats"}]
+        dict for {thread entry} [dict get $snapshot drivers] {
+            set stats [dict merge [dict get $entry counters] \
+                [dict create thread $thread module [dict get $entry module]]]
+            foreach {source target} {reading reading waitingForConnection waiting closing closing} {
+                dict set stats $target [dict get $entry socketStates $source]
+            }
+            dict set drivers $thread $stats
+        }
+        dict for {server data} [dict get $snapshot servers] {
+            dict for {pool entry} [dict get $data pools] {
+                set gauges [dict get $entry gauges]
+                dict set servers $server pools $pool [dict create \
+                    stats [dict get $entry counters] threads [dict get $gauges threads] \
+                    waiting [dict get $gauges waitingRequests] active [dict get $gauges activeRequests]]
+            }
+        }
+    } else {
+        foreach stats [ns_driver stats] {
+            dict set drivers [dict get $stats thread] $stats
+        }
     }
 
+    # Queue diagnostics are not currently exposed by ns_stats.
     foreach kind {driver writer spooler} {
         if {![catch {ns_driver queues $kind} entries]} {
             foreach entry $entries {
@@ -636,33 +1656,42 @@ proc _ns_stats.utilizationSample {} {
         }
     }
 
-    foreach server [ns_info servers] {
-        foreach pool [ns_server -server $server pools] {
-            set stats   [ns_server -server $server -pool $pool stats]
-            set threads [ns_server -server $server -pool $pool threads]
+    if {$snapshot eq ""} {
+        foreach server [ns_info servers] {
+            foreach pool [ns_server -server $server pools] {
+                set stats   [ns_server -server $server -pool $pool stats]
+                set threads [ns_server -server $server -pool $pool threads]
 
-            dict set servers $server pools $pool \
-                [dict create \
-                     stats   $stats \
-                     threads $threads \
-                     waiting [ns_server -server $server -pool $pool waiting] \
-                     active  [llength \
-                                  [ns_server -server $server \
-                                       -pool $pool all]]]
+                dict set servers $server pools $pool \
+                    [dict create \
+                         stats   $stats \
+                         threads $threads \
+                         waiting [ns_server -server $server -pool $pool waiting] \
+                         active  [llength \
+                                      [ns_server -server $server \
+                                           -pool $pool all]]]
+            }
         }
     }
 
     set linuxNetwork [_ns_stats.linuxNetworkSnapshot]
-    set now          [clock microseconds]
+    set now          [expr {$snapshot eq "" ? [clock microseconds] : [dict get $snapshot timestamp]}]
 
     set sample [dict create \
                     timestamp    $now \
+                    collector    $collector \
                     drivers      $drivers \
                     queues       $queues \
                     servers      $servers \
-                    linuxNetwork $linuxNetwork]
+                    linuxNetwork $linuxNetwork \
+                    supplementalTimestamp [clock microseconds]]
     set previous \
         [nsv_set -reset _ns_stats utilizationSample $sample]
+
+    # Do not compare differently shaped pool keys when the collector changes.
+    if {$previous ne "" && [_ns_stats.dictGetDef $previous collector legacy] ne $collector} {
+        set previous {}
+    }
 
     #
     # The stored sample may predate the linuxNetwork addition.
@@ -676,10 +1705,23 @@ proc _ns_stats.utilizationSample {} {
         set elapsed [expr {($now - [dict get $previous timestamp]) / 1000000.0}]
     }
 
+    set supplementalElapsed 0.0
+    if {[dict exists $previous supplementalTimestamp]} {
+        set supplementalElapsed [expr {([dict get $sample supplementalTimestamp]-[dict get $previous supplementalTimestamp])/1000000.0}]
+    }
+    set supplementalPrevious $previous
+    if {[_ns_stats.sampled $snapshot]} {
+        set previous [_ns_stats.utilization.samplePrevious $sample $snapshot]
+        set elapsed [dict get $snapshot sampling elapsedSeconds]
+    }
+
     return [dict create \
                 current  $sample \
                 previous $previous \
-                elapsed  $elapsed]
+                elapsed  $elapsed \
+                coreSnapshot $snapshot \
+                supplementalPrevious $supplementalPrevious \
+                supplementalElapsed $supplementalElapsed]
 }
 
 #
@@ -1507,6 +2549,24 @@ proc _ns_stats.utilization.globalSummary {sample threadCpu} {
         }
     }
 
+    set snapshot [_ns_stats.dictGetDef $sample coreSnapshot {}]
+    if {[_ns_stats.sampled $snapshot]} {
+        set requestRate [_ns_stats.utilization.sampleTotal $snapshot rates requests]
+        set queuedRate [_ns_stats.utilization.sampleTotal $snapshot rates queued]
+        set spooledRate [_ns_stats.utilization.sampleTotal $snapshot rates spools]
+        set droppedRate [_ns_stats.utilization.sampleTotal $snapshot rates dropped]
+        set droppedDelta [_ns_stats.utilization.sampleTotal $snapshot deltas dropped]
+        set droppedText [_ns_stats.utilization.displayIntervalCounter $droppedDelta $droppedRate "dropped request"]
+        set requests [_ns_stats.utilization.sampleTotal $snapshot deltas requests]
+        set timingValues {}
+        foreach {key label} {queuetime queue filtertime filter runtime run tracetime trace} {
+            set delta [_ns_stats.utilization.sampleTotal $snapshot deltas $key]
+            if {$requests>0 && $delta>=0} {
+                lappend timingValues "$label [_ns_stats.hr [expr {$delta/$requests}]]s"
+            }
+        }
+    }
+
     #
     # CPU percentages. The helper should return dictionaries containing
     # at least "name" and "cpu".
@@ -1516,6 +2576,8 @@ proc _ns_stats.utilization.globalSummary {sample threadCpu} {
     set connCpuTotal   0.0
     set writerCpuTotal 0.0
     set spoolerCpuTotal 0.0
+
+    set measured {}
 
     dict for {threadKey threadData} $threadCpu {
         set name [_ns_stats.dictGetDef $threadData name ""]
@@ -1527,16 +2589,20 @@ proc _ns_stats.utilization.globalSummary {sample threadCpu} {
 
         switch -glob -- $name {
             "-driver:*" {
+                dict set measured driver true
                 set driverCpuTotal [expr {$driverCpuTotal + $cpu}]
                 set driverCpuMax   [expr {max($driverCpuMax, $cpu)}]
             }
             "-conn:*" {
+                dict set measured conn true
                 set connCpuTotal [expr {$connCpuTotal + $cpu}]
             }
             "-writer:*" {
+                dict set measured writer true
                 set writerCpuTotal [expr {$writerCpuTotal + $cpu}]
             }
             "-spooler:*" {
+                dict set measured spooler true
                 set spoolerCpuTotal [expr {$spoolerCpuTotal + $cpu}]
             }
         }
@@ -1549,7 +2615,8 @@ proc _ns_stats.utilization.globalSummary {sample threadCpu} {
     set reasons  {}
 
     set linuxRows [_ns_stats.utilization.linuxRows \
-                       $current $previous $elapsed severity reasons]
+                       $current [_ns_stats.dictGetDef $sample supplementalPrevious $previous] \
+                       [_ns_stats.dictGetDef $sample supplementalElapsed $elapsed] severity reasons]
 
     if {$droppedRate > 0.0} {
         set severity critical
@@ -1599,6 +2666,13 @@ proc _ns_stats.utilization.globalSummary {sample threadCpu} {
     set driverCpuDisplay  [_ns_stats.utilization.colorize $driverCpuSeverity \
                                "[format %.1f $driverCpuTotal]% total, [format %.1f $driverCpuMax]% busiest thread"]
 
+    if {![dict exists $measured driver]} {
+        set driverCpuDisplay "unknown"
+    }
+    set connCpuDisplay [expr {[dict exists $measured conn] ? "[format %.1f $connCpuTotal]%" : "unknown"}]
+    set writerCpuDisplay [expr {[dict exists $measured writer] ? "[format %.1f $writerCpuTotal]%" : "unknown"}]
+    set spoolerCpuDisplay [expr {[dict exists $measured spooler] ? "[format %.1f $spoolerCpuTotal]%" : "unknown"}]
+
     set droppedSeverity    [expr {$droppedRate > 0.0 ? "critical" : "ok"}]
     set droppedRateDisplay [_ns_stats.utilization.colorize $droppedSeverity \
                                 $droppedText]
@@ -1616,8 +2690,8 @@ proc _ns_stats.utilization.globalSummary {sample threadCpu} {
                   [list "Pool Waiting"         $poolWaitingDisplay] \
                   [list "Connection Threads"   $connectionThreadsDisplay] \
                   [list "Driver CPU"           $driverCpuDisplay] \
-                  [list "Connection CPU"       "[format %.1f $connCpuTotal]%"] \
-                  [list "Writer / Spooler CPU" "[format %.1f $writerCpuTotal]% / [format %.1f $spoolerCpuTotal]%"] \
+                  [list "Connection CPU"       $connCpuDisplay] \
+                  [list "Writer / Spooler CPU" "$writerCpuDisplay / $spoolerCpuDisplay"] \
                   [list "Driver Socket States"  "$driverReading reading, $driverWaiting ready but unprocessed, $driverClosing closing"] \
                   {*}$linuxRows \
                   [list "Interval Request Handling" "[_ns_stats.utilization.displayRate $queuedRate] queued, [_ns_stats.utilization.displayRate $spooledRate] spooled, $droppedRateDisplay"] \
@@ -1904,6 +2978,10 @@ proc _ns_stats.utilization.poolRows {sample} {
     set previousTotalRequests [_ns_stats.utilization.sumPoolCounter $previous requests]
     set totalRequestRate      [_ns_stats.intervalRate $currentTotalRequests $previousTotalRequests $elapsed]
 
+    set snapshot [_ns_stats.dictGetDef $sample coreSnapshot {}]
+    if {[_ns_stats.sampled $snapshot]} {
+        set totalRequestRate [_ns_stats.utilization.sampleTotal $snapshot rates requests]
+    }
     set currentServers        [_ns_stats.dictGetDef $current servers {}]
 
     foreach server [lsort [dict keys $currentServers]] {
@@ -1932,7 +3010,7 @@ proc _ns_stats.utilization.poolRows {sample} {
             #
             # Pool-specific configuration.
             #
-            set configPath     [expr {$pool eq "" ? "ns/server/$server" : "ns/server/$server/pool/$pool"}]
+            set configPath     [expr {$pool in {{} default} ? "ns/server/$server" : "ns/server/$server/pool/$pool"}]
             set maxConnections [ns_config $configPath maxconnections 100]
 
             #
@@ -2363,7 +3441,7 @@ proc _ns_stats.columnLists {columnSpecs} {
 proc _ns_stats.utilization {} {
     set sample        [_ns_stats.utilizationSample]
 
-    set cpuData       [_ns_stats.threadCpuPercentages utilizationThreadCpuSample]
+    set cpuData       [_ns_stats.threadCpuPercentages utilizationThreadCpuSample [dict get $sample coreSnapshot]]
     set threadCpu     [_ns_stats.dictGetDef $cpuData byThread {}]
     set driverInfo    [_ns_stats.utilization.driverRows $sample $threadCpu]
     set driverRows    [dict get $driverInfo rows]
@@ -2587,13 +3665,15 @@ proc _ns_stats.utilization {} {
 
     append html \
         [_ns_stats.header "Utilization and Bottlenecks"] \
+        [_ns_stats.utilization.sourcePanel $sample] \
         [_ns_stats.results global-summary 0 {Metric Value} "?@page=utilization" $globalSummary 0 {left left}] \
         "\n<p></p>" \
         "\n<div class='utilization-charts'>$driverChart $poolChart</div>" \
         "<h2>Network Drivers</h2>" \
         [_ns_stats.results drivers 0 $driverTitles "?@page=utilization" $driverRows 0 $driverAlign] \
-        "<h2>Servers and Connection Pools</h2>" \
+        "<h2 id='nsstats-pools'>Servers and Connection Pools</h2>" \
         [_ns_stats.results utilization-pools 0 $poolTitles "?@page=utilization" $poolRows 0 $poolAlign] \
+        [_ns_stats.utilization.historyPanel] \
         [_ns_stats.footer]
     return $html
 }
@@ -2804,11 +3884,16 @@ proc _ns_stats.mem.nsvsize {} {
     set reverseSort [ns_queryget reversesort 1]
     set all         [ns_queryget all 0]
 
+    # Scope is optional: 4.99 uses the unchanged server-local interface.
+    set hasScope [expr {![catch {nsv_array scope _ns_stats}]}]
     set numericSort 1
     set colTitles   [list Array Elements Bytes "Agv. Content-Size"]
+    if {$hasScope} {
+        lappend colTitles Scope
+    }
     set rows        ""
 
-    if {$col == 1} {
+    if {$col == 1 || ($hasScope && $col == 5)} {
         set numericSort 0
     }
 
@@ -2825,7 +3910,13 @@ proc _ns_stats.mem.nsvsize {} {
             incr contentBytes $valueLength
             incr sizeBytes [expr {$valueLength + [string length $key] + 40}] ;# Tcl_HashEntry
         }
-        lappend rows [list $array $size $sizeBytes [expr {$size > 0 ? $contentBytes*1.0/$size : 0}]]
+        set row [list $array $size $sizeBytes [expr {$size > 0 ? $contentBytes*1.0/$size : 0}]]
+        if {$hasScope} {
+            set scope unknown
+            catch {set scope [nsv_array scope $array]}
+            lappend row [ns_quotehtml [expr {$scope eq "process" ? "Global" : ($scope eq "server" ? "Server: [ns_info server]" : "Unknown")}]]
+        }
+        lappend rows $row
         incr totalElements $size
         incr totalBytes $sizeBytes
     }
@@ -2840,13 +3931,20 @@ proc _ns_stats.mem.nsvsize {} {
         lappend table $row
     }
 
+    set scopeInfo "Shared variables for server [ns_quotehtml [ns_info server]]."
+    set align {left right right right}
+    if {$hasScope} {
+        set scopeInfo "Global and current-server shared variables; the Scope column identifies their ownership."
+        lappend align left
+    }
     append html \
         [_ns_stats.header "Nsv Size"] \
+        "<p>$scopeInfo</p>" \
         "<p>Nsv arrays: $nrArrays, elements: [_ns_stats.hr $totalElements], total bytes: [_ns_stats.hr $totalBytes]B</p>" \
         [_ns_stats.results nsv-size $col $colTitles ?@page=mem.nsvsize \
              $table \
              $reverseSort \
-             {left right right right}]
+             $align]
 
     append html [_ns_stats.footer]
     return $html
@@ -3569,7 +4667,7 @@ proc _ns_stats.process.modules {server} {
                 set name [dict get $info name]
                 set repository ""
                 switch -- $name {
-                    quic - nssock - nsssl - nscp - nsdb - nslog - nsproxy {
+                    quic - nssock - nsssl - nscp - nsdb - nslog - nsproxy - nscgi - nsperm {
                         set repository naviserver
                     }
                     nsdbpg - nsdbsqlite - nsdns - nssmtpd {
@@ -3620,6 +4718,36 @@ proc _ns_stats.process.dbaccess {{server ""}} {
     return [join [lmap pool $pools {ns_quotehtml $pool}] {, }]
 }
 
+# Report local SQLite files without opening a database connection. The driver
+# publishes the resolved datasource in the configuration; do not guess paths
+# for older drivers or interpret SQLite URI and in-memory datasources as files.
+proc _ns_stats.process.dbfilesize {pool} {
+    set section ns/db/pool/$pool
+    set driver [ns_config $section driver ""]
+    set library [ns_config ns/db/drivers $driver ""]
+    if {[file rootname [file tail $library]] ne "nsdbsqlite"} {
+        return ""
+    }
+    set path [ns_config $section datasource ""]
+    if {$path eq ":memory:"} {
+        return "Database size: in-memory"
+    }
+    if {$path eq "" || [string match "file:*" $path] || [file pathtype $path] ne "absolute"} {
+        return "Database file size: unavailable"
+    }
+    if {[catch {file size $path} bytes] || ![file isfile $path]} {
+        return "Database file size: unavailable"
+    }
+    set result "Database file: [_ns_stats.hr $bytes]B ($bytes bytes)"
+    foreach {suffix label} {-wal WAL -shm {shared memory}} {
+        set auxiliary $path$suffix
+        if {[file isfile $auxiliary] && ![catch {file size $auxiliary} bytes]} {
+            append result ", $label: [_ns_stats.hr $bytes]B ($bytes bytes)"
+        }
+    }
+    return $result
+}
+
 proc _ns_stats.process.dbpools {} {
     set lines ""
     if {![catch {set poolStats [ns_db stats]}]} {
@@ -3636,6 +4764,10 @@ proc _ns_stats.process.dbpools {} {
             }
             set stats [_ns_stats.pretty {statements gethandles {avgwaittime s} {avgsqltime s}} $stats %.1f]
             set versions [_ns_stats.process.dbversion $pool]
+            set size [_ns_stats.process.dbfilesize $pool]
+            if {$size ne ""} {
+                append versions "<br>$size"
+            }
             lappend lines "<tr><td class='subtitle'>[ns_quotehtml $pool]:</td><td width='100%'>$versions<br>$stats</td></tr>"
         }
     }
@@ -3787,6 +4919,7 @@ proc _ns_stats.lsof {pid} {
 }
 
 proc _ns_stats.process {} {
+    set runtimeSnapshot [_ns_stats.runtimeSnapshot]
     if {[info commands ns_driver] ne ""} {
         #
         # Get certificates to report expire dates (assumes that the
@@ -3961,11 +5094,12 @@ proc _ns_stats.process {} {
                     {*}$proxyItems \
                     "Task Threads"        [join $taskthreadinfo <br>] \
                     "Socket Callbacks"    [join [ns_info sockcallbacks] <br>] \
-                    "Running Scheduled Procs (repeated)" [join [_ns_stats.process.running_scheds] <br>] \
-                    "Running Jobs"        [join [_ns_stats.process.running_jobs] <br>] \
+                    "<a href='[_ns_stats.navigation.url background.sched]'>Running Scheduled Procs (repeated)</a>" [join [_ns_stats.process.running_scheds] <br>] \
+                    "<a href='[_ns_stats.navigation.url background.jobs]'>Running Jobs</a>" [join [_ns_stats.process.running_jobs] <br>] \
                    ]
 
     set html [_ns_stats.header Process]
+    append html [_ns_stats.utilization.sourcePanel [dict create coreSnapshot $runtimeSnapshot] process]
     append html [_ns_stats.process.table $values]
 
     foreach s [ns_info servers] {
@@ -3995,7 +5129,12 @@ proc _ns_stats.process {} {
         #
         set total_server_requests 0
         foreach pool [lsort [ns_server -server $s pools]] {
-            set rawstats [ns_server -server $s -pool $pool stats]
+            if {$runtimeSnapshot ne ""} {
+                set poolName [expr {$pool eq "" ? "default" : $pool}]
+                set rawstats [dict get $runtimeSnapshot servers $s pools $poolName counters]
+            } else {
+                set rawstats [ns_server -server $s -pool $pool stats]
+            }
             dict set pool_info $s $pool rawstats $rawstats
             incr total_server_requests [dict get $rawstats requests]
         }
@@ -4024,8 +5163,17 @@ proc _ns_stats.process {} {
             #
             #ns_log notice "try to get [list dict get $pool_info $s $pool rawstats]"
             set rawstats [dict get $pool_info $s $pool rawstats]
-            set rawthreads [list {*}[ns_server -server $s -pool $pool threads] \
-                                waiting [ns_server -server $s -pool $pool waiting] \
+            if {$runtimeSnapshot ne ""} {
+                set poolName [expr {$pool eq "" ? "default" : $pool}]
+                set gauges [dict get $runtimeSnapshot servers $s pools $poolName gauges]
+                set threads [dict get $gauges threads]
+                set waiting [dict get $gauges waitingRequests]
+            } else {
+                set threads [ns_server -server $s -pool $pool threads]
+                set waiting [ns_server -server $s -pool $pool waiting]
+            }
+            set rawthreads [list {*}$threads \
+                                waiting $waiting \
                                 started [dict get $rawstats connthreads] \
                                 maxconnections [ns_config $config_path maxconnections] \
                                ]
@@ -4207,7 +5355,7 @@ proc _ns_stats.mapped {} {
         [_ns_stats.header [list Process "?@page=process"] Mapped] \
         "<h4>Server $serverName: Connection Pool mapping for pool <em>$poolName</em></h4>" \
         [_ns_stats.results process $col $colTitles ?$queryContext $htmlRows $reverseSort] \
-        "<p>Back to <a href='?@page=process'>process</a> page</p>" \
+        "<p>Back to <a href='?@page=process#[ns_urlencode $server]'>process</a></p>" \
         [_ns_stats.footer]
     return $html
 }
@@ -4283,7 +5431,7 @@ proc _ns_stats.requestprocs {} {
         "<h4>Registered Request Handlers of Server <em>$serverName</em></h4>" \
         [_ns_stats.checkboxFilter methodfilter $filterCheckboxes $hidden] \
         [_ns_stats.results requestprocs $col $colTitles ?$queryContext $htmlRows $reverseSort] \
-        "<p>Back to <a href='?@page=process'>process</a> page</p>" \
+        "<p>Back to <a href='?@page=process#[ns_urlencode $server]'>process</a></p>" \
         [_ns_stats.footer]
     return $html
 }
@@ -4322,7 +5470,7 @@ proc _ns_stats.url2file {} {
         [_ns_stats.header [list Process "?@page=process"] "Request-to-File Mappings"] \
         "<h4>Registered Url2File Mapping of Server <em>$serverName</em></h4>" \
         [_ns_stats.results requestprocs $col $colTitles ?$queryContext $htmlRows $reverseSort] \
-        "<p>Back to <a href='?@page=process'>process</a> page</p>" \
+        "<p>Back to <a href='?@page=process#[ns_urlencode $server]'>process</a></p>" \
         [_ns_stats.footer]
     return $html
 }
@@ -4739,8 +5887,8 @@ proc _ns_stats.log.logfiles {section param} {
             continue
         }
         lmap file [glob $logfile*] {
-            if {[file size $file] < 10} continue
-            #ns_log notice "file size <$file> [file size $file]"
+            # An empty active log must remain selectable after rotation.
+            if {![file isfile $file] || ![file readable $file]} continue
             set file
         }
     }]]]
@@ -5042,13 +6190,16 @@ proc _ns_stats.log.mkchart {section param title {renderer _ns_stats.log.chart}} 
     return $html
 }
 
-proc _ns_stats.threadCpuPercentages {sampleKey} {
+proc _ns_stats.threadCpuPercentages {sampleKey {snapshot {}}} {
+    if {$snapshot eq ""} {
+        set snapshot [_ns_stats.runtimeSnapshot]
+    }
     set pid         [pid]
     set rawThreads  [ns_info threads]
     set cpuSource   none
     set cpuTimes    {}
     set collected   {}
-    set current     [dict create threads {}]
+    set current     [dict create threads {} collectorMode [expr {[_ns_stats.sampled $snapshot] ? "sample" : ($snapshot eq "" ? "legacy" : "snapshot")}]]
     set cpuAvailable 0
 
     #
@@ -5063,13 +6214,19 @@ proc _ns_stats.threadCpuPercentages {sampleKey} {
                     byThread  {}]
     }
 
-    try {
-        set cpuTimes [ns_info threadcputimes]
-        set cpuSource api
-    } on error {errorMsg} {
-        if {[file isdirectory /proc/$pid/task]} {
-            set cpuSource proc
-            set HZ 100
+    if {$snapshot ne ""} {
+        if {[_ns_stats.dictGetDef $snapshot availability cpu false]} {
+            set cpuSource core
+        }
+    } else {
+        try {
+            set cpuTimes [ns_info threadcputimes]
+            set cpuSource api
+        } on error {errorMsg} {
+            if {[file isdirectory /proc/$pid/task]} {
+                set cpuSource proc
+                set HZ 100
+            }
         }
     }
 
@@ -5095,7 +6252,16 @@ proc _ns_stats.threadCpuPercentages {sampleKey} {
         set stime      0.0
         set valid      0
 
-        if {$cpuSource eq "api"} {
+        if {$cpuSource eq "core"} {
+            set identity [list $tid $createTime]
+            if {[dict exists $snapshot cpu $identity]} {
+                set times [dict get $snapshot cpu $identity]
+                set utime [expr {[dict get $times user] / 1000000.0}]
+                set stime [expr {[dict get $times system] / 1000000.0}]
+                set state [_ns_stats.dictGetDef $times state 0]
+                set valid 1
+            }
+        } elseif {$cpuSource eq "api"} {
             if {[dict exists $cpuTimes $tid]} {
                 set times [dict get $cpuTimes $tid]
 
@@ -5161,10 +6327,19 @@ proc _ns_stats.threadCpuPercentages {sampleKey} {
                                valid      $valid]
     }
 
-    set sampledAt [clock microseconds]
+    set sampledAt [expr {$snapshot eq "" ? [clock microseconds] : [dict get $snapshot timestamp]}]
     dict set current sampled_at $sampledAt
 
-    set previous [nsv_set -reset _ns_stats $sampleKey $current]
+    set sampled [_ns_stats.sampled $snapshot]
+    set previous {}
+    if {$sampled} {
+        nsv_set _ns_stats $sampleKey [dict create collectorMode sample]
+    } else {
+        set previous [nsv_set -reset _ns_stats $sampleKey $current]
+        if {[_ns_stats.dictGetDef $previous collectorMode legacy] ne [dict get $current collectorMode]} {
+            set previous {}
+        }
+    }
 
     set elapsed 0.0
     if {$previous ne ""
@@ -5173,6 +6348,10 @@ proc _ns_stats.threadCpuPercentages {sampleKey} {
             ($sampledAt - [dict get $previous sampled_at])
             / 1000000.0
         }]
+    }
+
+    if {$sampled} {
+        set elapsed [dict get $snapshot sampling elapsedSeconds]
     }
 
     #
@@ -5193,7 +6372,10 @@ proc _ns_stats.threadCpuPercentages {sampleKey} {
         set valid      [dict get $entry valid]
         set cpu        -1.0
 
-        if {$valid
+        if {$sampled} {
+            set measured [_ns_stats.dictGetDef $snapshot cpuPercent threads $threadKey percent {}]
+            if {$measured ne ""} {set cpu $measured}
+        } elseif {$valid
             && $elapsed > 0.0
             && [dict exists $previous threads $threadKey]} {
             set old [dict get $previous threads $threadKey]
@@ -5366,7 +6548,7 @@ proc _ns_stats.background.jobs {} {
             set numericSort 0
         }
 
-        set colTitles [list Name Desc maxThreads numRunning Req]
+        set colTitles [list "Queue name" Desc maxThreads numRunning Req]
 
         foreach ql [ns_job queuelist] {
             array set qa $ql
@@ -5721,6 +6903,10 @@ if {$::raw eq "1"} {
 if { [info commands _ns_stats.$page] eq "" } {
     set page process
 }
+
+# OpenACS can source this script in a procedure, making page local. Publish the
+# validated selection for navigation helpers and ADP templates in either setup.
+set ::page $page
 
 proc _ns_stats.public_ip {ip} {
     try {
