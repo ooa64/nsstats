@@ -304,6 +304,9 @@ proc ::_ns_stats.navigation.style {} {
 .ns-nav-items a:hover,.ns-nav-items a[aria-current] {background:var(--color-dropdown-hover-bg,#e6eef7);}
 .ns-nav-mobile {display:none;}
 .ns-measurement-controls input[name="statsWindow"] {width:6em;box-sizing:border-box;padding:3px 6px;border:1px solid var(--color-border,#888);background:var(--color-body-bg,#fff);color:var(--color-body-text,#000);opacity:1;}
+.ns-reload-notice {padding:12px 16px;border-left:4px solid var(--color-anchor,#004080);background:var(--color-secondary-bg,#eef5fb);color:var(--color-body-text,#000);border-radius:3px;}
+.ns-reload-notice-icon {margin-right:0.5em;color:var(--color-anchor,#004080);}
+.ns-library-tag {display:block;font-size:0.85em;}
 .ns-module-reload {display:inline-block;margin:0 0 0 6px;vertical-align:middle;}
 .ns-module-reload button {display:inline-flex;align-items:center;justify-content:center;padding:4px;border:1px solid var(--color-border,#888);border-radius:3px;background:var(--color-body-bg,#fff);color:var(--color-anchor,#004080);cursor:pointer;}
 .ns-module-reload button:focus-visible {outline:2px solid currentColor;outline-offset:2px;}
@@ -2035,7 +2038,8 @@ proc ::_ns_stats.linuxDiskSnapshot {} {
         }
         if {!$valid} {continue}
         set disk [dict create reads [lindex $fields 0] readMs [lindex $fields 3] \
-                      writes [lindex $fields 4] writeMs [lindex $fields 7]]
+                      writes [lindex $fields 4] writeMs [lindex $fields 7] \
+                      inFlight [lindex $fields 8] ioMs [lindex $fields 9] weightedIoMs [lindex $fields 10]]
         set inflight [regexp -all -inline {\S+} [::_ns_stats.linuxReadFile $path/inflight]]
         if {[llength $inflight] == 2 && [string is entier -strict [lindex $inflight 1]]
             && [lindex $inflight 1] >= 0} {
@@ -2074,6 +2078,15 @@ proc ::_ns_stats.utilization.diskRows {current previous elapsed {levels {}}} {
     return $rows
 }
 
+# A threshold crossing is not by itself evidence of sustained contention.
+proc ::_ns_stats.utilization.diskClass {operations elapsed averageQueue} {
+    set minimum [ns_config -int -min 1 ns/module/nsstats diskLatencyMinOperations 20]
+    set rate [ns_config -int -min 1 ns/module/nsstats diskLatencyMinOpsPerSecond 1]
+    if {$averageQueue ne "" && $averageQueue>=1.0} {return contention}
+    if {$operations<$minimum || $operations/double($elapsed)<$rate} {return low-volume}
+    return under-load
+}
+
 # Track consecutive observed intervals, separately for reads and writes.
 # Idle I/O, missing devices and counter resets break the streak.
 proc ::_ns_stats.utilization.diskHealth {current previous elapsed history warning critical} {
@@ -2082,10 +2095,16 @@ proc ::_ns_stats.utilization.diskHealth {current previous elapsed history warnin
         foreach {label count ticks} {read reads readMs write writes writeMs} {
             set level ok
             set ms -1
+            set n 0
+            set averageQueue {}
             if {$elapsed > 0 && [dict exists $previous $name]} {
                 set old [dict get $previous $name]
                 set n [::_ns_stats.intervalDelta [dict get $disk $count] [dict get $old $count]]
                 set t [::_ns_stats.intervalDelta [dict get $disk $ticks] [dict get $old $ticks]]
+                if {[dict exists $disk weightedIoMs] && [dict exists $old weightedIoMs]
+                    && [dict get $disk weightedIoMs]>=[dict get $old weightedIoMs]} {
+                    set averageQueue [expr {([dict get $disk weightedIoMs]-[dict get $old weightedIoMs])/(1000.0*$elapsed)}]
+                }
                 if {$n > 0 && $t >= 0} {
                     set ms [expr {double($t)/$n}]
                     if {$ms >= $critical} {set level critical} elseif {$ms >= $warning} {set level warning}
@@ -2098,6 +2117,21 @@ proc ::_ns_stats.utilization.diskHealth {current previous elapsed history warnin
                 }
                 dict set result $name $label $threshold $streak
             }
+            set classification unknown
+            if {$ms>=0} {set classification [::_ns_stats.utilization.diskClass $n $elapsed $averageQueue]}
+            set previousContention [::_ns_stats.dictGetDef $history $name $label contention 0]
+            set contention 0
+            if {$level ne "ok" && $classification eq "contention"} {set contention [expr {$previousContention+1}]}
+            set sparse 0
+            if {$level ne "ok" && $classification eq "low-volume"} {
+                set sparse [expr {1+[::_ns_stats.dictGetDef $history $name $label lowVolume 0]}]
+            }
+            dict set result $name $label lowVolume $sparse
+            dict set result $name $label contention $contention
+            dict set result $name $label classification $classification
+            dict set result $name $label operations $n
+            dict set result $name $label operationsPerSecond [expr {$elapsed>0 ? max(0,$n)/double($elapsed) : 0}]
+            dict set result $name $label averageQueueDepth $averageQueue
             dict set result $name $label latency $ms
         }
     }
@@ -2128,11 +2162,20 @@ proc ::_ns_stats.utilization.diskWarnings {current previous elapsed severityVar 
                 set level warning
             }
             if {$level eq "ok"} {continue}
+            set classification [dict get $entry classification]
+            # Keep sparse slow I/O visible without a critical overload claim.
+            if {$classification eq "low-volume"} {set level warning}
             if {$level eq "critical" || [::_ns_stats.dictGetDef $levels $name ok] eq "ok"} {
                 dict set levels $name $level
             }
             if {$level eq "critical" || $severity eq "ok"} {set severity $level}
-            set reason "disk [ns_quotehtml $name] $label latency [::_ns_stats.hr [expr {[dict get $entry latency]/1000.0}]]s (measurement interval; $level threshold [::_ns_stats.hr [expr {($level eq "critical" ? $critical : $warning)/1000.0}]]s)"
+            set thresholdLevel [expr {[dict get $entry latency]>=$critical ? "critical" : "warning"}]
+            set reason "disk [ns_quotehtml $name] $label latency [::_ns_stats.hr [expr {[dict get $entry latency]/1000.0}]]s (measurement interval; $thresholdLevel threshold [::_ns_stats.hr [expr {($thresholdLevel eq "critical" ? $critical : $warning)/1000.0}]]s); [dict get $entry operations] completed operations, [format %.2f [dict get $entry operationsPerSecond]]/s"
+            switch -- $classification {
+                low-volume {append reason "; low-volume latency, not evidence of sustained contention"}
+                under-load {append reason "; high latency under load, contention not established"}
+                contention {append reason "; queue-backed high latency, average device queue [format %.2f [dict get $entry averageQueueDepth]]"}
+            }
             set queue [::_ns_stats.dictGetDef $disks $name writeQueue 0]
             set oldQueue [::_ns_stats.dictGetDef $previous linuxNetwork disks $name writeQueue 0]
             if {$label eq "write" && $queue > 0 && $oldQueue > 0} {
@@ -2220,6 +2263,34 @@ proc ::_ns_stats.utilization.diskBackgroundRead {samples {reader ::ns_stats}} {
     return [lrange $records [expr {[llength $records]-$samples}] end]
 }
 
+proc ::_ns_stats.utilization.storageStallsPanel {} {
+    set html {<details class="ns-storage-stalls"><summary>Recent storage stalls (background samples)</summary>}
+    if {[catch {ns_stats storage stalls -server [ns_info server] -limit 20} result]} {
+        return "$html<p>Retained storage-stall records unavailable.</p></details>"
+    }
+    append html {<p>Interval means, not individual syscall timings. Request queues are endpoint gauges; correlation does not establish cause. Slow SQL is not collected here.</p>}
+    set rows {}
+    foreach record [dict get $result records] {
+        set queue [::_ns_stats.dictGetDef $record averageQueueDepth {}]
+        set assessment [::_ns_stats.utilization.diskClass [dict get $record operations] [dict get $record elapsedSeconds] $queue]
+        set values [list [clock format [expr {int([dict get $record to])}] -format {%Y-%m-%d %H:%M:%S %Z}] \
+            "[dict get $record device] / [dict get $record operation]" \
+            "[dict get $record operations] ([format %.2f [dict get $record operationsPerSecond]]/s)" \
+            "[format %.2f [dict get $record latencyMs]] ms" \
+            [expr {$queue eq "" ? "unknown" : [format %.2f $queue]}] \
+            [dict get $record requestQueues] $assessment]
+        lappend rows [lmap value $values {ns_quotehtml $value}]
+    }
+    append html [::_ns_stats.results storage-stalls 0 \
+        {{Interval end} {Device / operation} Operations {Mean latency} {Average device queue} {Request queues} Assessment} \
+        {?@page=utilization} $rows 0 {left left right right right left left}]
+    if {[dict get $result records] eq ""} {append html {<p>No retained storage stalls.</p>}}
+    if {[dict get $result omittedRecords]>0} {append html "<p>[dict get $result omittedRecords] older retained records are not displayed.</p>"}
+    append html "<p>Bounded to [dict get $result maxRecords] records and [dict get $result retentionSeconds] seconds; survives Tcl reloads, not process restarts.</p>"
+    append html </details>
+    return $html
+}
+
 proc ::_ns_stats.utilization.diskSustainedPanel {} {
     if {![string equal -nocase Linux $::tcl_platform(os)]} {return {}}
     set html {<h3>Sustained disk latency (background samples)</h3>}
@@ -2244,8 +2315,16 @@ proc ::_ns_stats.utilization.diskSustainedPanel {} {
             if {[dict get $entry critical]>=$samples} {set level critical
             } elseif {[dict get $entry warning]>=$samples} {set level warning}
             if {$level ne "ok"} {
+                set classification [dict get $entry classification]
+                if {$classification eq "low-volume"} {set level warning}
+                set assessment "repeated high latency; contention not established"
+                if {$classification eq "low-volume"} {
+                    set assessment "high latency across intervals; latest interval low-volume; contention not established"
+                    if {[dict get $entry lowVolume]>=$samples} {set assessment "repeated low-volume latency; not sustained contention"}
+                }
+                if {[dict get $entry contention]>=$samples} {set assessment "sustained contention evidence (device queue present in every interval)"}
                 lappend alerts [::_ns_stats.utilization.colorize $level \
-                    "[string toupper $level]: disk [ns_quotehtml $name] $label latency exceeded the $level threshold for $samples consecutive background intervals" 1]
+                    "[string toupper $level]: disk [ns_quotehtml $name] $label latency exceeded the $level threshold for $samples consecutive background intervals; $assessment" 1]
             }
         }
     }
@@ -3836,6 +3915,7 @@ proc ::_ns_stats.utilization {} {
         [::_ns_stats.utilization.sourcePanel $sample] \
         [::_ns_stats.results global-summary 0 {Metric Value} "?@page=utilization" $globalSummary 0 {left left}] \
         [::_ns_stats.utilization.diskSustainedPanel] \
+        [::_ns_stats.utilization.storageStallsPanel] \
         "\n<p></p>" \
         "\n<div class='utilization-charts'>$driverChart $poolChart</div>" \
         "<h2>Network Drivers</h2>" \
@@ -4136,7 +4216,7 @@ proc ::_ns_stats.log.prepare_content {type content} {
 # excerpts and result pages bounded independently of the size of the log file.
 proc ::_ns_stats.log.isheader {line} {
     regsub -all {\x1b\[[0-9;]*m} $line {} line
-    return [regexp {^\[[0-9]{2}/[A-Za-z]{3}/[0-9]{4}:[0-9:.]+\]\[[^\]\r\n]*\]\[.*\] [A-Za-z][A-Za-z0-9_-]*:} $line]
+    return [regexp {^\[[0-9]{2}/[A-Za-z]{3}/[0-9]{4}:[0-9:.]+\]\[[^\]\r\n]*\]\[.*\] [A-Za-z][A-Za-z0-9_()-]*:} $line]
 }
 
 proc ::_ns_stats.log.find {channel literal snapshot} {
@@ -4316,8 +4396,37 @@ proc ::_ns_stats.log.pagesize {value} {
     return $value
 }
 
+proc ::_ns_stats.log.accesspaths {server} {
+    set paths {}
+    if {![catch {ns_server -server $server traces} traces]} {
+        foreach trace $traces {
+            if {[lrange $trace 0 1] eq {trace nslog:conntrace}
+                && [llength $trace]==3 && [file pathtype [lindex $trace 2]] eq "absolute"} {
+                lappend paths [lindex $trace 2]
+            }
+        }
+    }
+    if {[llength $paths]} {
+        return $paths
+    }
+    # Older cores may lack native trace paths.
+    set section ns/server/$server/module/nslog
+    set path [ns_config $section file]
+    if {$path eq {}} {
+        set defaults [ns_configsection -filter defaults $section]
+        if {$defaults ne {}} {
+            set path [ns_set get $defaults file]
+        }
+    }
+    if {$path eq {}} {return {}}
+    if {[file pathtype $path] eq "relative"} {
+        set path [file normalize [file join [ns_config ns/parameters logdir] $path]]
+    }
+    return [list $path]
+}
+
 proc ::_ns_stats.log.searchpage {filter system_log suffix cursor {pageSize 200}} {
-    set notices {}; set sections [dict create access {} system {}]
+    set notices {}; set sections {}
     if {[catch {::_ns_stats.log.pagesize $pageSize} pageSize]} {return "<p>[ns_quotehtml $pageSize]</p>"}
     if {$filter eq {} || [string length [encoding convertto utf-8 $filter]]>4096 || [regexp {[\x00\r\n]} $filter]} {
         return "<p>Use a nonempty literal filter of at most 4096 UTF-8 bytes, without NUL characters or line breaks.</p>"
@@ -4331,17 +4440,13 @@ proc ::_ns_stats.log.searchpage {filter system_log suffix cursor {pageSize 200}}
     } else {
         set files {}; set paths {}
         foreach s [ns_info servers] {
-            set section ns/server/$s/module/nslog
-            set path [ns_config $section file]
-            if {$path eq {}} {
-                set defaults [ns_configsection -filter defaults $section]
-                if {$defaults eq {}} continue
-                set path [ns_set get $defaults file]
+            foreach path [::_ns_stats.log.accesspaths $s] {
+                if {$suffix ne {} && [file exists $path$suffix]} {append path $suffix}
+                if {$path ni $paths} {
+                    lappend paths $path
+                    lappend files [dict create path $path kind access offset 0]
+                }
             }
-            if {$path eq {}} continue
-            if {[file pathtype $path] eq "relative"} {set path [file normalize [file join [ns_config ns/parameters logdir] $path]]}
-            if {$suffix ne {} && [file exists $path$suffix]} {append path $suffix}
-            if {$path ni $paths} {lappend paths $path; lappend files [dict create path $path kind access offset 0]}
         }
         lappend files [dict create path $system_log kind system offset 0]
         if {[llength $files]>64} {
@@ -4392,7 +4497,7 @@ proc ::_ns_stats.log.searchpage {filter system_log suffix cursor {pageSize 200}}
             # Records normally include their line terminator. Add a separator
             # only for clipped excerpts or final lines without a newline.
             if {[string index $text end] ne "\n"} {append text \n}
-            dict append sections [dict get $item kind] $label$text
+            dict append sections $index $label$text
             incr records
         }
         incr bytes [dict get $result bytes]
@@ -4430,9 +4535,12 @@ proc ::_ns_stats.log.searchpage {filter system_log suffix cursor {pageSize 200}}
                 "<input type='hidden' name='log_cursor' value='$token'><button type='submit'>Show more</button> <span>More matches may be available.</span></form>"
         }
     }
-    foreach {kind title} {access {Access log} system {System log}} {
-        set text [dict get $sections $kind]
-        if {$text ne {}} {append html "<h4>$title:</h4><pre>[::_ns_stats.log.prepare_content $kind $text]</pre>"}
+    dict for {fileIndex text} $sections {
+        set item [lindex $files $fileIndex]
+        set kind [dict get $item kind]
+        set title [expr {$kind eq "access" ? "Access log" : "System log"}]
+        set filename [ns_quotehtml [file tail [dict get $item path]]]
+        append html "<h4>$title: $filename</h4><pre>[::_ns_stats.log.prepare_content $kind $text]</pre>"
     }
     return $html
 }
@@ -5176,8 +5284,6 @@ proc ::_ns_stats.mem.tcl {} {
     set twaits 0
     set tfree 0
     set tops 0
-    set ov 0
-    set op 0
     set av 0
 
     if {[info commands ::dict] ne ""} {
@@ -5258,9 +5364,12 @@ proc ::_ns_stats.mem.tcl {} {
         <br>"
     }
 
-    if { $trequest > 0 } {
-        set ov [expr {$talloc - $trequest}]
-        set op [format %4.2f [expr {double($ov) * 100 / $trequest}]]
+    set totalWasted N/A
+    set overheadPercent N/A
+    if {$trequest > 0} {
+        set overhead [expr {$talloc - $trequest}]
+        set totalWasted [::_ns_stats.hr $overhead]B
+        set overheadPercent [format %4.2f%% [expr {double($overhead) * 100 / $trequest}]]
     }
     if { $tops > 0 } {
         set av [format %4.2f [expr {double(100) - (double($tlocks) * 100) / $tops}]]
@@ -5281,8 +5390,8 @@ proc ::_ns_stats.mem.tcl {} {
             <tr><td>Bytes Requested:</td><td>[::_ns_stats.hr $trequest]B</td></tr>
             <tr><td>Bytes Free:</td><td>[::_ns_stats.hr $tfree]B</td></tr>
             <tr><td>Bytes Allocated:</td><td>[::_ns_stats.hr $talloc]B</td></tr>
-            <tr><td>Bytes Wasted:</td><td>[::_ns_stats.hr $ov]B</td></tr>
-            <tr><td>Byte Overhead:</td><td>${op}%</td></tr>
+            <tr><td>Bytes Wasted:</td><td>$totalWasted</td></tr>
+            <tr><td>Byte Overhead:</td><td>$overheadPercent</td></tr>
             <tr><td>Locks:</td><td>$tlocks</td></tr>
             <tr><td>Lock Waits:</td><td>$twaits</td></tr>
             <tr><td>Lock Wait Ratio:</td><td>${wr}%</td></tr>
@@ -5472,7 +5581,7 @@ proc ::_ns_stats.process.reloadNotice {} {
     if {![nsv_exists _ns_stats $key]} {return ""}
     lassign [nsv_get _ns_stats $key] module count
     nsv_unset _ns_stats $key
-    return "<p role='status'>Reloaded Tcl code for module [ns_quotehtml $module] ($count affected Tcl files). Compiled code is unchanged. The updated blueprint is published; active interpreters adopt it through normal propagation.</p>"
+    return "<p class='ns-reload-notice' role='status'><span class='ns-reload-notice-icon' aria-hidden='true'>&#9432;</span>Reloaded Tcl code for module [ns_quotehtml $module] ($count affected Tcl files). Compiled code is unchanged. The updated blueprint is published; active interpreters adopt it through normal propagation.</p>"
 }
 
 proc ::_ns_stats.process.modules {server} {
@@ -5833,6 +5942,123 @@ proc ::_ns_stats.libraries.reload {} {
     return ""
 }
 
+proc ::_ns_stats.libraries.packageOrigin {origin} {
+    set kind [dict get $origin kind]
+    if {$kind eq "preexisting"} {return "Present before tracking started"}
+    set file [dict get $origin file]
+    if {$kind eq "native"} {
+        set init [dict get $origin init]
+        set label [expr {$init eq "" ? "native extension" : "native extension $init"}]
+        return [expr {$file eq "" ? "Native extension $init (existing image)" : "$file ($label)"}]
+    }
+    set location $file
+    if {$file ne ""} {
+        append location : [dict get $origin line]
+    } else {set location "Dynamic Tcl caller"}
+    if {[dict get $origin proc] ne ""} {append location " (" [dict get $origin proc] ")"}
+    if {[dict get $origin packages] ne ""} {
+        set location "[join [dict get $origin packages] {, }]: $location"
+    }
+    if {[dict exists $origin requested] && [dict get $origin requested] ne ""} {
+        append location " (require "
+        if {[dict get $origin exact]} {append location "-exact "}
+        append location [join [dict get $origin requested] { }] ")"
+    }
+    return $location
+}
+
+proc ::_ns_stats.libraries.packageLabels {labels {provider {}}} {
+    set grouped {}
+    foreach label $labels {
+        set short $label
+        # Source paths end in a line number. Native libraries have an annotation.
+        if {[regexp -indices {(^|: | — )(/[^\n]+?)(?=:[0-9]+(?: |$)| \(native extension)} $label match prefix path]} {
+            lassign $path start end
+            set short [string replace $label $start $end [file tail [string range $label $start $end]]]
+            if {$provider ne {} && [string first "${provider}: " $label] == 0} {
+                set short $provider
+            }
+        }
+        dict lappend grouped $short $label
+    }
+    set html ""
+    dict for {short locations} $grouped {
+        set tooltip ""
+        if {$locations ne [list $short]} {
+            set tooltip " title='[ns_quotehtml [join $locations \n]]'"
+        }
+        append html "<div$tooltip>[ns_quotehtml $short]</div>"
+    }
+    return $html
+}
+
+proc ::_ns_stats.libraries.packageProvenance {name version} {
+    set key [list package $name $version]
+    set record {}
+    if {[nsv_exists ns_package_provenance $key]} {set record [nsv_get ns_package_provenance $key]}
+    set result {}
+    foreach field {providedBy requiredBy} {
+        set labels {}
+        if {$record eq {}} {
+            set labels [list "Not recorded"]
+        } else {
+            set origins [dict get $record $field]
+            if {$field eq "requiredBy" && $name eq "Tcl" && $origins ne {}} {
+                set labels [list "Tcl runtime requirements omitted"]
+            } else {
+                set grouped {}
+                foreach origin $origins {
+                    set first [expr {$field eq "requiredBy"
+                                    && [dict remove $origin requested exact] eq [dict get $record firstLoadedBy]}]
+                    if {$field eq "requiredBy" && [dict get $origin packages] ne {}} {
+                        set callers [lsearch -all -inline -not -exact [dict get $origin packages] $name]
+                    } else {
+                        set callers [list [::_ns_stats.libraries.packageOrigin $origin]]
+                    }
+                    foreach caller $callers {
+                        if {$first || ![dict exists $grouped $caller]} {
+                            dict set grouped $caller $first
+                        }
+                    }
+                }
+                dict for {caller first} $grouped {
+                    if {$first} {append caller " (first load)"}
+                    lappend labels $caller
+                }
+            }
+            if {$labels eq {}} {set labels [list "None observed"]}
+        }
+        dict set result $field [lsort -unique $labels]
+    }
+    return $result
+}
+
+# Invert observed require sites so a package row shows its dependencies.
+proc ::_ns_stats.libraries.packageRequirements {} {
+    set requirements {}
+    foreach name [lsort -dictionary [package names]] {
+        set version [package provide $name]
+        if {$version eq "" || $name eq "Tcl"} {continue}
+        set key [list package $name $version]
+        if {![nsv_exists ns_package_provenance $key]} {continue}
+        set record [nsv_get ns_package_provenance $key]
+        set first [dict get $record firstLoadedBy]
+        foreach origin [dict get $record requiredBy] {
+            set callers [dict get $origin packages]
+            if {$callers eq {}} {continue}
+            set location [::_ns_stats.libraries.packageOrigin [dict replace $origin packages {}]]
+            set label "$name — $location"
+            if {[dict remove $origin requested exact] eq $first} {
+                append label " (first load)"
+            }
+            foreach caller $callers {
+                if {$caller ne $name} {dict lappend requirements $caller $label}
+            }
+        }
+    }
+    return $requirements
+}
+
 proc ::_ns_stats.tcl.libraries {} {
     if {[ns_queryget moduleReloadAction {}] ne ""} {
         return [::_ns_stats.process.reload tcl.libraries]
@@ -5849,7 +6075,7 @@ proc ::_ns_stats.tcl.libraries {} {
     if {[nsv_exists _ns_stats $key]} {
         lassign [nsv_get _ns_stats $key] name count
         nsv_unset _ns_stats $key
-        append html "<p role='status'>Reloaded core Tcl file [ns_quotehtml $name] ($count affected files). The updated blueprint is published; active interpreters adopt it through normal propagation.</p>"
+        append html "<p class='ns-reload-notice' role='status'><span class='ns-reload-notice-icon' aria-hidden='true'>&#9432;</span>Reloaded core Tcl file [ns_quotehtml $name] ($count affected files). The updated blueprint is published; active interpreters adopt it through normal propagation.</p>"
     }
     append html "<form method='get' action='[ns_quotehtml [ns_conn url]]'><input type='hidden' name='@page' value='tcl.libraries'><label>Filter files and packages <input name='tclFilter' value='[ns_quotehtml $filter]'></label> <button type='submit'>Filter</button></form>"
     set core [::_ns_stats.libraries.inventory -core]
@@ -5879,11 +6105,15 @@ proc ::_ns_stats.tcl.libraries {} {
         foreach module [lsort [dict keys $modules]] {
             set info [dict get $modules $module]
             set version [expr {[dict exists $info version] ? [dict get $info version] : {}}]
-            set versionLabel [expr {$version eq {} ? "Not reported" : $version}]
+            set versionLabel [ns_quotehtml [expr {$version eq {} ? "Not reported" : $version}]]
+            set tag [expr {[dict exists $info tag] ? [dict get $info tag] : {}}]
+            if {$tag ne {}} {
+                append versionLabel "<small class='ns-library-tag'>Tag: [ns_quotehtml $tag]</small>"
+            }
             set entries {}
             dict for {name record} [::_ns_stats.libraries.inventory $module] {
                 set path [dict get $record path]
-                if {![::_ns_stats.libraries.matches $filter [list $module $version $name $path]]} {continue}
+                if {![::_ns_stats.libraries.matches $filter [list $module $version $tag $name $path]]} {continue}
                 append entries "<div><code>[ns_quotehtml $path]</code>"
                 if {![dict get $record reloadable]} {append entries { (startup only)}}
                 append entries {</div>}
@@ -5893,15 +6123,28 @@ proc ::_ns_stats.tcl.libraries {} {
             if {[::_ns_stats.process.reloadAvailable] && [::_ns_stats.process.reloadable $module]} {
                 set action [::_ns_stats.process.reloadButton $module tcl.libraries]
             }
-            append html "<tr><td>[ns_quotehtml $module]</td><td class='ns-library-version'>[ns_quotehtml $versionLabel]</td><td class='ns-library-files'>$entries</td><td class='ns-library-action'>$action</td></tr>"
+            append html "<tr><td>[ns_quotehtml $module]</td><td class='ns-library-version'>$versionLabel</td><td class='ns-library-files'>$entries</td><td class='ns-library-action'>$action</td></tr>"
         }
     }
     append html {</tbody></table></div>}
-    append html {<h2>Loaded Tcl packages — inspection only</h2><p><strong>Tcl packages are listed for information only. Package reloading is not supported.</strong> Only packages with a provided version in this interpreter are listed; merely available packages are omitted.</p><div class='w3-responsive'><table class='data-table w3-table'><thead><tr><th>Package</th><th>Provided version</th></tr></thead><tbody>}
+    append html {<h2>Loaded Tcl packages — inspection only</h2><p><strong>Tcl packages are listed for information only. Package reloading is not supported.</strong> Only packages with a provided version in this interpreter are listed; merely available packages are omitted. Provenance is observed in this virtual server since tracing started. Required by groups successful requirements from other packages by package name and shows source locations for other observed callers. The first successful loading requirement is marked in both dependency columns. Requires lists distinct successful require sites for each package and marks sites that first loaded a dependency. Tcl runtime requirements are omitted.</p><div class='w3-responsive'><table class='data-table w3-table'><thead><tr><th>Package</th><th>Provided version</th><th>Provided by</th><th>Required by</th><th>Requires</th></tr></thead><tbody>}
+    set requirements [::_ns_stats.libraries.packageRequirements]
     foreach name [lsort -dictionary [package names]] {
         set version [package provide $name]
-        if {$version eq "" || ![::_ns_stats.libraries.matches $filter [list $name $version]]} {continue}
-        append html "<tr><td>[ns_quotehtml $name]</td><td>[ns_quotehtml $version]</td></tr>"
+        if {$version eq ""} {continue}
+        set provenance [::_ns_stats.libraries.packageProvenance $name $version]
+        dict set provenance requires [expr {[dict exists $requirements $name] ? [dict get $requirements $name] : {}}]
+        set search [list $name $version]
+        dict for {field labels} $provenance {lappend search {*}$labels}
+        if {![::_ns_stats.libraries.matches $filter $search]} {continue}
+        append html "<tr><td>[ns_quotehtml $name]</td><td>[ns_quotehtml $version]</td>"
+        dict for {field labels} $provenance {
+            append html <td>
+            set provider [expr {$field eq "providedBy" ? $name : {}}]
+            append html [::_ns_stats.libraries.packageLabels $labels $provider]
+            append html </td>
+        }
+        append html </tr>
     }
     append html {</tbody></table></div>}
     append html [::_ns_stats.footer]
@@ -6496,9 +6739,8 @@ proc ::_ns_stats.list-lsof {} {
             | (<a href='?@page=list-lsof&all=1'>all</a>)
             |<p>
         }]]
-        try {
-            ns_http keepalives
-        } on ok {keepalives} {
+        # Older cores do not expose HTTP client keep-alive slots.
+        if {![catch {ns_http keepalives} keepalives]} {
             append body \
                 "<strong>ns_http keep-alive slots:</strong>\n" \
                 "<blockquote><pre>[join $keepalives \n]</pre></blockquote>\n"
@@ -6529,7 +6771,9 @@ proc ::_ns_stats.proxy-workers {} {
     set pool         [ns_queryget pool]
     set cmd          [ns_queryget cmd ""]
     set queryContext @page=[ns_queryget @page]&pool=$pool
-    set workers      [ns_proxy workers $pool]
+    if {[catch {ns_proxy workers $pool} workers]} {
+        return "[::_ns_stats.header [list Process "?@page=process"] "nsproxy Workers"]<p>Worker details are unavailable.</p>[::_ns_stats.footer]"
+    }
     set numericSort  1
     set colTitles    [list ID pid created runs state]
     if {$col == 0 || $col == 3} {

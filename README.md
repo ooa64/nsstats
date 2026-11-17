@@ -325,6 +325,25 @@ packages with a provided version in the current interpreter; it does not load
 merely available packages. This is an interpreter inventory, not a process-wide
 union of packages loaded by other threads or virtual servers.
 
+When NaviServer package provenance is enabled, the package table also shows
+**Provided by**, **Required by**, and **Requires**. Required by groups observed requirements from other Tcl packages by package
+name and shows source locations for direct callers. Package names reflect
+the observed loading context. Tcl runtime requirements are omitted from the
+table. Provider and first-load details remain searchable alongside the
+displayed requirements. File locations show filenames with full paths in
+hover tooltips. Requires lists distinct successful require sites for
+each package and marks the first-load site.
+
+Records are shared per virtual server in `ns_package_provenance` NSVs and are
+not copied into every interpreter blueprint. They include later worker loads,
+but the displayed package inventory remains local to the viewing interpreter.
+Registrations replayed from a blueprint do not become new loading events.
+Packages present before tracing attaches are explicitly marked, rather than
+assigned a guessed caller. Older servers without records show **Not recorded**.
+Installing the new core startup code and restarting is required to observe
+startup history. Viewing this page never loads packages or package scripts.
+
+
 Recognized Git build tags for core modules and nsdbpg, nsdbsqlite, nsdns, and
 nssmtpd link to commits in their GitHub repositories. Unknown modules or tags
 without a commit hash remain plain text.
@@ -592,7 +611,7 @@ remain standalone Tcl tests.
 
 The utilization summary checks mean read or write completion latency
 (queue plus service time) over the selected measurement window. A threshold
-crossing immediately colors the disk row and contributes warning/critical status;
+crossing immediately colors the disk row and contributes qualified status;
 no consecutive-interval requirement applies to the selected window.
 These settings are in `ns/module/nsstats`:
 
@@ -626,3 +645,34 @@ both endpoints; this does not establish a continuously nonempty queue. It also
 says nothing about read queue occupancy. Unavailable Linux disk counters produce
 an informational row without changing the overall status. Other platforms do not
 show these diagnostics.
+
+
+### Storage-stall evidence and low-volume latency
+
+The utilization page distinguishes low-volume latency from high latency under load
+and sustained contention evidence. With the defaults, a crossing with fewer than
+20 completed operations or less than 1 operation/second is low-volume unless the
+interval average device queue is at least 1. It remains an amber warning even if
+its mean exceeds the critical latency threshold. Counts and rates accompany every
+crossing. `diskLatencyMinOperations` (20) and `diskLatencyMinOpsPerSecond` (1) in
+`ns/module/nsstats` control these volume qualifiers. Other critical conditions are
+never downgraded. This is a diagnostic classification, not proof of user impact.
+
+The separate background assessment requires queue evidence in every consecutive
+high-latency interval before describing sustained contention. Repeated sparse slow
+I/O is described separately. Queue depth includes requests in service; it does not
+identify a process, distinguish controller from media time, or prove resource
+competition. Missing/idle/reset/gapped data breaks continuity. Existing latency
+thresholds continue to apply.
+
+The Recent storage stalls panel is collapsed by default and uses the standard
+nsstats table layout. Its table reads at most 20 entries from `ns_stats storage
+stalls`, without probes or SQL. The core sampler records sparse interval observations
+by default at 20 ms; `ns/stats` storageStallThresholdMs, storageStallRetention (1h),
+and storageStallMaxRecords (128) bound this independently of the page and SQLite
+history. It records completed operation counts/rates, mean latency, device queue,
+utilization and endpoint server/pool request queues where available. It retains
+low-volume stalls rather than hiding them. No slow-SQL events or statements are
+collected; correlate the recorded interval with existing SQL logs separately.
+A bounded buffer is not a complete incident log. It survives Tcl reload, not restart.
+Deploy both core tcl/ns_stats.tcl and nsstats.tcl; binaries need not be rebuilt.
